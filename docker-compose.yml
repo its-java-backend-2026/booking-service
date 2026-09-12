@@ -1,0 +1,56 @@
+# IL COMPOSE DI QUESTO SOLO REPOSITORY: booking-service e il SUO database.
+#
+#   docker compose up -d       avvia solo il database
+#   docker compose down -v     ferma E CANCELLA i dati
+#
+# ===========================================================================
+# QUESTO FILE NON AVVIA L'INTERO SISTEMA, ED E' VOLUTO.
+#
+# Un compose che facesse "build: ../shows-service" renderebbe questo
+# repository incostruibile da solo: chi lo clona senza avere anche gli altri
+# due accanto si ritroverebbe un file che non funziona. Un repository per
+# servizio ha senso solo se ogni repository si costruisce da solo.
+#
+# Il sistema completo (tre servizi, due database, il finto fornitore) lo
+# monta il repository di orchestrazione, cinema-deploy. E' li' che sta il
+# docker-compose.yml del passo 6.11.
+#
+# A cosa serve allora questo? A sviluppare: si avvia il database qui, si
+# lancia booking-service dall'IDE (con i default di application.yaml, che
+# puntano a localhost) e si ha il debugger attaccato al servizio su cui si
+# sta lavorando.
+# ===========================================================================
+
+services:
+
+  booking-db:
+    image: postgres:17-alpine
+    container_name: booking-db
+    environment:
+      POSTGRES_DB: ${BOOKING_DB_NAME:-booking_db}
+      POSTGRES_USER: ${BOOKING_DB_USER:-cinema}
+      POSTGRES_PASSWORD: ${BOOKING_DB_PASSWORD:-cinema}
+    ports:
+      # 5433 e non 5432: shows-db occupa gia' la 5432 sul portatile.
+      # E' la conseguenza pratica di "un database per servizio": due
+      # PostgreSQL veri, non due schemi nello stesso.
+      - "${BOOKING_DB_PORT:-5433}:5432"
+    volumes:
+      - booking_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # SENZA QUESTO, booking-service parte prima che PostgreSQL accetti
+      # connessioni, Flyway fallisce e il container muore. depends_on da solo
+      # aspetta che il container sia AVVIATO, non che il servizio dentro sia
+      # PRONTO.
+      test: ["CMD-SHELL", "pg_isready -U ${BOOKING_DB_USER:-cinema} -d ${BOOKING_DB_NAME:-booking_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  booking_pgdata:

@@ -1,0 +1,180 @@
+### booking-service — porta 8083
+###
+### E' il servizio che CHIAMA gli altri due. Perche' queste richieste
+### funzionino servono shows-service (8081) e pricing-service (8082) accesi:
+###     cd ../cinema-deploy && docker compose up --build
+###
+### CONSEGNA G6: la POST qui sotto crea la prenotazione con il prezzo
+### corretto e i posti scalati, attraversando tre processi.
+
+@host = http://localhost:8083
+
+
+### =====================================================================
+###  IL CASO NORMALE  —  passo 6.10
+### =====================================================================
+
+### Prenota 2 posti per uno studente  ->  201 Created + header Location
+###
+### Cosa succede dietro, in quest'ordine:
+###   1. GET  shows-service   /shows/1          prezzo base, orario, titolo
+###   2. POST pricing-service /prices/quote     prezzo unitario
+###   3. POST shows-service   /shows/1/reserve  i posti vengono scalati
+###   4. INSERT su booking_db                   -> 201
+###
+### Nella risposta c'e' il sagaId: cercarlo nei log di TUTTI E TRE i servizi
+### mostra la stessa operazione vista da tre processi diversi.
+###     docker compose logs | grep <sagaId>
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 1,
+  "customerType": "STUDENT",
+  "quantity": 2
+}
+
+
+### La stessa cosa a prezzo pieno
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 1,
+  "customerType": "STANDARD",
+  "quantity": 1
+}
+
+
+### La prenotazione appena creata
+### NON chiama nessun altro servizio: titolo e orario sono dati nostri
+### (passo 6.3). Si puo' provare spegnendo shows-service: questa risponde
+### lo stesso.
+GET {{host}}/bookings/1
+
+
+### Elenco paginato, dalla piu' recente (la regola del passo 3.4)
+GET {{host}}/bookings?page=0&size=10&sort=createdAt,desc
+
+
+### =====================================================================
+###  LA TABELLA DI TRADUZIONE DEL PASSO 6.9
+###
+###    404 di shows        ->  404 nostro
+###    409 di shows        ->  409 nostro
+###    5xx / timeout       ->  503 nostro, NON 500
+###    altri 4xx di shows  ->  500 nostro (e' un bug NOSTRO)
+### =====================================================================
+
+### Spettacolo inesistente  ->  404 con type "spettacolo-non-trovato"
+### Il 404 dell'altro servizio resta un 404: l'utente ha chiesto qualcosa
+### che non c'e', non e' un guasto nostro.
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 99999,
+  "customerType": "STUDENT",
+  "quantity": 2
+}
+
+
+### Posti insufficienti  ->  409 con type "posti-insufficienti"
+### 409 e non 400: la richiesta e' scritta bene, e' lo STATO dello
+### spettacolo a renderla impossibile. Ripetere questa chiamata finche'
+### i posti finiscono.
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 1,
+  "customerType": "STANDARD",
+  "quantity": 20
+}
+
+
+### Servizio a valle giu'  ->  503 con Retry-After e "servizio": "..."
+###
+### Per provarlo davvero, da un altro terminale:
+###     docker compose stop pricing-service
+### poi questa richiesta, e poi
+###     docker compose start pricing-service
+###
+### Deve rispondere 503 e NON 500: il nostro codice ha funzionato, e' un
+### altro a non esserci. E deve rispondere in circa 2 secondi, non dopo
+### un minuto: sono i timeout del passo 6.6.
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 1,
+  "customerType": "STUDENT",
+  "quantity": 2
+}
+
+
+### =====================================================================
+###  GLI ERRORI DEL CLIENT  —  400, e non arrivano nemmeno al service
+### =====================================================================
+
+### Quantita' oltre il tetto di 20  ->  400
+### Il limite sta al confine: senza, una richiesta da due miliardi di posti
+### arriverebbe fino a shows-service a fargli fare lavoro per niente.
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 1,
+  "customerType": "STUDENT",
+  "quantity": 500
+}
+
+
+### Categoria sconosciuta  ->  400
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 1,
+  "customerType": "VIP",
+  "quantity": 2
+}
+
+
+### Il prezzo mandato dal client viene IGNORATO, non accettato  ->  201
+### unitPrice non esiste in CreateBookingRequest: Jackson lo butta via, e il
+### prezzo resta quello detto da pricing-service. Accettarlo sarebbe la
+### vulnerabilita' piu' classica di un carrello.
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 1,
+  "customerType": "STUDENT",
+  "quantity": 1,
+  "unitPrice": 0.01
+}
+
+
+### Prenotazione inesistente  ->  404 con type "prenotazione-non-trovata"
+GET {{host}}/bookings/99999
+
+
+### L'id non e' un numero  ->  400 con type "parametro-non-valido"
+GET {{host}}/bookings/abc
+
+
+### =====================================================================
+###  LE SONDE DI SALUTE
+### =====================================================================
+
+### Attenzione: la readiness di booking-service NON dipende dalla salute di
+### shows e pricing, ed e' voluto. Se ci dipendesse, un guasto a valle
+### toglierebbe dal bilanciatore anche le nostre istanze sane e farebbe
+### smettere di rispondere pure GET /bookings, che non chiama nessuno.
+GET {{host}}/actuator/health/readiness
+
+GET {{host}}/actuator/health/liveness
+
+### La documentazione delle API
+GET {{host}}/swagger-ui.html

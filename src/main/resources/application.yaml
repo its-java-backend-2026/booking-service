@@ -1,0 +1,96 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: booking-service
+
+  # PASSO 6.2 — IL NOSTRO database, non uno schema dentro shows_db.
+  # Un'altra porta perche' sul portatile shows-db sta gia' sulla 5432.
+  datasource:
+    url: ${BOOKING_DB_URL:jdbc:postgresql://localhost:5433/booking_db}
+    username: ${BOOKING_DB_USER:cinema}
+    password: ${BOOKING_DB_PASSWORD:cinema}
+
+  jpa:
+    hibernate:
+      # lo schema lo fa Flyway: Hibernate si limita a verificare che combaci.
+      # E' il controllo che scopre subito se l'entita' e la V1 si sono
+      # allontanate — per esempio un @Column(length = 200) contro un
+      # VARCHAR(100).
+      ddl-auto: validate
+    # Con open-in-view la sessione JPA resterebbe aperta fino alla fine della
+    # risposta HTTP, e le query partirebbero durante la serializzazione,
+    # fuori da qualsiasi transazione. Spenta, sempre.
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+# ===========================================================================
+# PASSO 6.6 — DOVE ABITANO I SERVIZI A VALLE.
+#
+# I default sono gli indirizzi visti DA FUORI Docker (localhost e le porte
+# pubblicate), cosi' booking-service si avvia dall'IDE contro gli altri due
+# in compose. Dentro la rete di compose gli indirizzi cambiano e li passa il
+# compose stesso: http://shows-service:8081, http://pricing-service:8082.
+#
+# Gli indirizzi sono CONFIGURAZIONE e non costanti nel codice: e' la stessa
+# regola del passo 5.4, e senza di essa lo stesso jar non potrebbe girare in
+# due ambienti diversi.
+# ===========================================================================
+cinema:
+  shows:
+    url: ${CINEMA_SHOWS_URL:http://localhost:8081}
+  pricing:
+    url: ${CINEMA_PRICING_URL:http://localhost:8082}
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    org.hibernate.SQL: ${SQL_LOG_LEVEL:DEBUG}
+    it.its.cinema.bookingservice: INFO
+
+# ===========================================================================
+# Il profilo "docker", dopo il separatore --- (passo 5.4).
+# ===========================================================================
+---
+spring:
+  config:
+    activate:
+      on-profile: docker
+
+logging:
+  level:
+    org.hibernate.SQL: ${SQL_LOG_LEVEL:INFO}
+    it.its.cinema.bookingservice: ${BOOKING_LOG_LEVEL:INFO}
+
+# Liveness e readiness sono DUE DOMANDE DIVERSE:
+#   /actuator/health/liveness   "il processo e' vivo?"      se no, riavviami
+#   /actuator/health/readiness  "posso ricevere traffico?"  se no, non mandarmene
+#
+# ATTENZIONE, e' il punto da discutere in aula: la readiness di
+# booking-service NON deve dipendere dalla salute di shows-service e
+# pricing-service. Sembrerebbe sensato ("senza di loro non so prenotare") ed
+# e' un errore grave: un guasto di un servizio a valle toglierebbe dal
+# bilanciatore anche le nostre istanze sane, e GET /bookings — che non chiama
+# nessuno — smetterebbe di rispondere insieme a POST /bookings.
+# I guasti a valle si gestiscono con i 503 del passo 6.9 e con il circuit
+# breaker del G7, non spegnendosi.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
