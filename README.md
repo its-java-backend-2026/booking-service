@@ -199,13 +199,25 @@ un'operazione compatibile — le nostre prenotazioni si fermerebbero.
 
 ```bash
 cp .env.example .env
-docker compose up -d          # avvia solo booking-db sulla 5433
+docker compose up -d booking-db   # solo il database, sulla 5433
 ./mvnw spring-boot:run
 ```
 
 I default di `application.yaml` puntano a `localhost:8081` e `localhost:8082`:
 servono `shows-service` e `pricing-service` accesi perché `POST /bookings`
 funzioni.
+
+### Questo repository in container
+
+```bash
+docker compose up -d --build      # booking-db + booking-service sulla 8083
+```
+
+Costruisce l'immagine da questo `Dockerfile` e basta: gli altri due servizi
+stanno negli altri repository e qui non ci sono. `CINEMA_SHOWS_URL` e
+`CINEMA_PRICING_URL` puntano di default a `host.docker.internal`, così il
+container li trova se li si sta facendo girare dall'IDE. Se non rispondono,
+`POST /bookings` dà `503` e `GET /bookings` continua a funzionare.
 
 ### Il sistema completo
 
