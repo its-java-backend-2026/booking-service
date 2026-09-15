@@ -94,6 +94,53 @@
 		</dependency>
 
 		<!--
+		  ======================================================================
+		  PASSO 9.5 — LE METRICHE IN FORMATO PROMETHEUS.
+
+		  scope runtime: nessuna classe nostra lo importa, serve solo che stia
+		  sul classpath. Da quel momento /actuator/prometheus esiste e Spring
+		  Boot ci mette dentro, GRATIS, cose che nessuno ha scritto:
+
+		    http.server.requests             quante richieste, quanto lente,
+		                                     con quale codice di stato
+		    hikaricp.connections.active      quante connessioni del pool sono
+		                                     occupate — il numero che spiega
+		                                     i blocchi del passo 6.6
+		    jvm.memory.used, jvm.gc.*        memoria e garbage collector
+		    resilience4j.circuitbreaker.*    lo stato dei breaker del G7
+		                                     (solo dove Resilience4j c'e')
+
+		  "Gratis" e' il punto: la strumentazione manuale si scrive una volta,
+		  poi si dimentica di aggiornarla, e le metriche mentono. Questa arriva
+		  dagli stessi filtri che gestiscono le richieste, quindi non puo'
+		  disallinearsi.
+		  ======================================================================
+		-->
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-registry-prometheus</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+
+		<!--
+		  ======================================================================
+		  PASSO 9.6 — IL TRACING, E LA PRIMA DELLE DUE TRAPPOLE.
+
+		  In Boot 3 si mettevano DUE dipendenze a mano
+		  (micrometer-tracing-bridge-brave e zipkin-reporter-brave) e non
+		  bastavano: portavano le classi ma NON l'auto-configurazione. I
+		  servizi partivano, il traceId compariva perfino nei log, e Zipkin
+		  restava ostinatamente vuoto — senza un errore, senza un warning.
+
+		  Lo starter porta tutto, compresa l'auto-configurazione.
+		  ======================================================================
+		-->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-zipkin</artifactId>
+		</dependency>
+
+		<!--
 		  ========================================================================
 		  PASSO 7.1 — LA RESILIENZA, E PERCHE' STA SOLO QUI.
 

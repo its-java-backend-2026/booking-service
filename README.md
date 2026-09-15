@@ -616,8 +616,52 @@ contano, e i breaker non sono fra quelli.
 
 ---
 
+## G9 — observability (passi 9.4-9.8)
+
+Dal G9 questo servizio sta dietro il **gateway**: il client chiede
+`POST http://localhost:8080/api/bookings` e non sa che esiste la porta 8083.
+Qui non cambia niente — i servizi non sanno di stare dietro un gateway, ed è
+voluto.
+
+| dove | cosa |
+|---|---|
+| `/actuator/health` | liveness e readiness, **due domande diverse** (la readiness non dipende dai servizi a valle: vedi più sotto) |
+| `/actuator/prometheus` | `http.server.requests`, `hikaricp.connections.active`, **`resilience4j.circuitbreaker.state`** |
+| <http://localhost:9411> | le tracce: una prenotazione è **una** traccia che attraversa sei servizi |
+
+`resilience4j.circuitbreaker.state` è l'aggiunta che rende il G7 **misurabile**
+e non più solo osservabile a occhio: lo stato dei breaker diventa una serie
+temporale su cui si può mettere un allarme.
+
+### `traceId` e `sagaId` sono due cose diverse, e servono tutte e due
+
+```
+INFO [booking-service,68a1f2c3d4e5,9f8e7d6c5b4a] [saga 3f2a1b9c-...] riservati 2 posti
+                      ^^^^^^^^^^^^                     ^^^^^^^^^^^^
+                      la RICHIESTA                     l'ACQUISTO
+```
+
+- il **`traceId`** lo genera la strumentazione e dura quanto la richiesta HTTP.
+  Comprende anche ciò che una saga non fa — una `GET /bookings`, per esempio;
+- il **`sagaId`** lo scegliamo noi (passo 6.4) e dura quanto l'operazione di
+  acquisto. È anche la chiave di idempotenza dei partecipanti (passo 8.3).
+
+Una saga ritentata avrebbe **due** `traceId` e **un** `sagaId`. È esattamente
+la distinzione che serve quando si indaga.
+
+### Il `traceId` si propaga da solo, a una condizione
+
+Sulle chiamate uscenti la propagazione è automatica **se** il `RestClient` è
+costruito dal `Builder` auto-configurato — che è il motivo per cui serve
+`spring-boot-starter-restclient` (passo 6.5). Un `RestClient.create()` scritto a
+mano non porta la strumentazione, e la traccia si spezza esattamente dove
+serviva: al confine fra due servizi.
+
+---
+
 ## Stack
 
 Spring Boot 4.1.1 · Java 21 · RestClient (`spring-boot-starter-restclient`,
 obbligatorio in Boot 4) · Resilience4j (Spring Cloud 2025.1.3) · PostgreSQL 17 ·
-Flyway · springdoc-openapi · Lombok · Testcontainers
+Flyway · springdoc-openapi · Lombok · Testcontainers · Micrometer + Prometheus ·
+Micrometer Tracing + Zipkin

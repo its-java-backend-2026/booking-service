@@ -288,6 +288,22 @@ logging:
     org.hibernate.SQL: ${SQL_LOG_LEVEL:DEBUG}
     it.its.cinema.bookingservice: INFO
 
+  # ===========================================================================
+  # PASSO 9.8 — traceId E spanId IN OGNI RIGA DI LOG.
+  #
+  # Qui vale piu' che altrove: booking-service e' l'orchestratore, e una sua
+  # riga di log e' l'inizio di una storia che continua in altri quattro
+  # processi. Il sagaId (passo 6.4) ricuce l'ACQUISTO; il traceId ricuce la
+  # RICHIESTA HTTP, e comprende anche le chiamate che una saga non fa — per
+  # esempio una GET /bookings.
+  #
+  # Sono due identificativi diversi e servono tutti e due: il sagaId lo
+  # scegliamo noi e dura quanto l'operazione, il traceId lo genera la
+  # strumentazione e dura quanto la richiesta.
+  # ===========================================================================
+  pattern:
+    level: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]"
+
 # ===========================================================================
 # ACTUATOR — e il posto in cui si legge lo stato del breaker (passo 7.7).
 #
@@ -316,7 +332,11 @@ management:
         # circuitbreakerevents e retryevents: lo storico, cioe' QUANDO e'
         # cambiato e per colpa di quale chiamata. E' cio' che si guarda
         # quando "ogni tanto risponde 503" e nessuno sa perche'.
-        include: health,info,circuitbreakers,circuitbreakerevents,retries,retryevents
+        # Dal G9 si aggiungono metrics e prometheus (passi 9.4 e 9.5). Fra
+        # le metriche che compaiono senza scrivere niente ci sono anche
+        # resilience4j.circuitbreaker.state e resilience4j.retry.calls: il
+        # G7 diventa misurabile, non solo osservabile a occhio.
+        include: health,info,metrics,prometheus,circuitbreakers,circuitbreakerevents,retries,retryevents
   endpoint:
     health:
       probes:
@@ -325,6 +345,37 @@ management:
       group:
         readiness:
           include: readinessState
+
+  # =========================================================================
+  # PASSO 9.6 — IL TRACING, E LA SECONDA TRAPPOLA.
+  #
+  # sampling ed export stanno SOTTO LA STESSA chiave "tracing". Scriverli come
+  # due blocchi separati — un "management: tracing: sampling:" e piu' sotto un
+  # altro "management: tracing: export:" — crea una chiave YAML DUPLICATA, e
+  # in quel caso il servizio non parte affatto. E' l'unico errore della
+  # giornata che si fa notare subito, ed e' quasi un sollievo.
+  #
+  # E la property dell'endpoint e' cambiata rispetto a Boot 3:
+  #     management.tracing.export.zipkin.endpoint   <- questa
+  #     management.zipkin.tracing.endpoint          <- non lega piu'
+  # Anche questa, sbagliata, non da' nessun errore: Zipkin resta vuoto.
+  #
+  # IL traceId SI PROPAGA DA SOLO sulle chiamate uscenti, ma a una
+  # condizione: che il RestClient sia costruito dal Builder
+  # AUTO-CONFIGURATO (passo 6.5). E' quello che porta la strumentazione. Un
+  # RestClient.create() scritto a mano non la ha, e la traccia si spezza
+  # esattamente dove serviva — al confine fra due servizi.
+  # =========================================================================
+  tracing:
+    sampling:
+      # 1.0 = si traccia TUTTO: in aula e' quello che serve. In esercizio si
+      # scende a 0.1 o meno, perche' tracciare tutto costa banda, spazio e un
+      # po' di latenza — e con mille richieste al secondo nessuno guardera'
+      # mai le altre 999.
+      probability: ${TRACING_PROBABILITY:1.0}
+    export:
+      zipkin:
+        endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
 
 
 # ===========================================================================

@@ -485,3 +485,33 @@ POST http://localhost:8081/shows/1/release
 Content-Type: application/json
 
 { "sagaId": "prova-idempotenza-1", "quantity": 2 }
+
+
+### =====================================================================
+###  G9 — DAL GATEWAY, E LA TRACCIA  (passi 9.2 e 9.6)
+###
+###  Dal G9 il client non dovrebbe conoscere la porta 8083: chiede al
+###  gateway, che sta sulla 8080. Le richieste qui sopra restano perche' in
+###  aula serve poter confrontare le due strade.
+### =====================================================================
+
+### La stessa prenotazione, dal gateway
+POST http://localhost:8080/api/bookings
+Content-Type: application/json
+Idempotency-Key: dal-gateway-{{$timestamp}}
+
+{
+  "showId": 1,
+  "customerId": "{{cliente}}",
+  "customerType": "STUDENT",
+  "quantity": 2
+}
+
+### Poi la traccia si guarda su http://localhost:9411 (Run Query).
+### CONSEGNA G9: e' UNA traccia sola, con 13 span, che attraversa sei servizi.
+
+### Le metriche, fra cui lo stato dei breaker del G7 (passo 9.5)
+GET {{host}}/actuator/prometheus
+
+### Lo stato dei breaker, come al G7
+GET {{host}}/actuator/circuitbreakers
