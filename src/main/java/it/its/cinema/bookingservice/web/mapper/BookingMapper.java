@@ -29,7 +29,8 @@ public class BookingMapper {
                 b.getQuantity(),
                 b.getUnitPrice(),
                 b.getTotalPrice(),
-                b.getCreatedAt());
+                b.getCreatedAt(),
+                b.getStato().name());
     }
 
     /**

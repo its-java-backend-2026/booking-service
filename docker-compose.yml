@@ -10,13 +10,12 @@
 # Qui dentro c'e' solo cio' che questo repository sa costruire: il proprio
 # Dockerfile ("build: .") e il proprio database. Non c'e' e non ci deve essere
 # un "build: ../shows-service": renderebbe questo repository incostruibile da
-# solo, e chi lo clona senza avere gli altri due accanto si ritroverebbe un
-# file che non funziona. Un repository per servizio ha senso solo se ogni
+# solo, e chi lo clona senza avere gli altri accanto si ritroverebbe un file
+# che non funziona. Un repository per servizio ha senso solo se ogni
 # repository si costruisce da solo.
 #
-# Il sistema completo (tre servizi, due database, il finto fornitore) lo
-# monta il repository di orchestrazione, cinema-deploy. E' li' che sta il
-# docker-compose.yml del passo 6.11.
+# Il sistema completo — dal G8 cinque servizi, quattro database e il finto
+# fornitore — lo monta il repository di orchestrazione, cinema-deploy.
 #
 # A cosa serve allora questo? A due cose:
 #   - provare l'IMMAGINE di booking-service da sola, senza clonare il resto;
@@ -75,17 +74,22 @@ services:
       # =====================================================================
       # PASSO 6.6 — I SERVIZI A VALLE NON SONO IN QUESTO COMPOSE.
       #
-      # Qui non esistono shows-service e pricing-service: stanno negli altri
-      # due repository. I default puntano quindi all'HOST, cosi' se li si sta
-      # facendo girare dall'IDE (8081 e 8082) il container li trova lo stesso.
-      # Se non girano, POST /bookings risponde 503 (passo 6.9) e
-      # GET /bookings continua a funzionare: e' il comportamento voluto.
+      # Qui non esistono shows-service, pricing-service, payment-service e
+      # loyalty-service: stanno negli altri quattro repository. I default
+      # puntano quindi all'HOST, cosi' se li si sta facendo girare dall'IDE
+      # (8081, 8082, 8085, 8084) il container li trova lo stesso. Se non
+      # girano, POST /bookings risponde 503 (passo 6.9) e GET /bookings
+      # continua a funzionare: e' il comportamento voluto.
       #
       # Per il sistema completo, con i nomi di rete veri
       # (http://shows-service:8081), si usa cinema-deploy.
       # =====================================================================
       CINEMA_SHOWS_URL: ${CINEMA_SHOWS_URL:-http://host.docker.internal:8081}
       CINEMA_PRICING_URL: ${CINEMA_PRICING_URL:-http://host.docker.internal:8082}
+      # PASSO 8.1 e 8.2 — i due partecipanti della saga, anche loro fuori da
+      # questo compose: stanno nei loro repository.
+      CINEMA_PAYMENT_URL: ${CINEMA_PAYMENT_URL:-http://host.docker.internal:8085}
+      CINEMA_LOYALTY_URL: ${CINEMA_LOYALTY_URL:-http://host.docker.internal:8084}
       SQL_LOG_LEVEL: ${SQL_LOG_LEVEL:-INFO}
       BOOKING_LOG_LEVEL: ${BOOKING_LOG_LEVEL:-INFO}
     extra_hosts:
@@ -98,7 +102,7 @@ services:
     healthcheck:
       # readiness, non liveness: "posso ricevere traffico?". Vedere il
       # commento in application.yaml sul perche' NON debba dipendere dalla
-      # salute di shows-service e pricing-service.
+      # salute dei quattro servizi a valle.
       test: ["CMD-SHELL", "wget -q -O- http://localhost:8083/actuator/health/readiness | grep -q UP"]
       interval: 10s
       timeout: 3s

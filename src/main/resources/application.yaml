@@ -58,6 +58,11 @@ cinema:
     url: ${CINEMA_SHOWS_URL:http://localhost:8081}
   pricing:
     url: ${CINEMA_PRICING_URL:http://localhost:8082}
+  # PASSO 8.1 e 8.2 — i due partecipanti nuovi della saga.
+  payment:
+    url: ${CINEMA_PAYMENT_URL:http://localhost:8085}
+  loyalty:
+    url: ${CINEMA_LOYALTY_URL:http://localhost:8084}
 
 
 # ===========================================================================
@@ -171,6 +176,21 @@ resilience4j:
         ignoreExceptions:
           - it.its.cinema.bookingservice.domain.SpettacoloNonTrovatoException
           - it.its.cinema.bookingservice.domain.PostiEsauritiException
+          # =================================================================
+          # PASSO 8.1 — E IL RIFIUTO DEL PAGAMENTO STA QUI, NON FRA I
+          # FALLIMENTI. E' LA RIGA PIU' IMPORTANTE DI TUTTO IL BLOCCO.
+          #
+          # Un pagamento rifiutato e' una risposta PERFETTA a una domanda
+          # che non si poteva esaudire, esattamente come il 404 e il 409
+          # qui sopra. Se contasse come fallimento, dieci carte scadute di
+          # fila — che in una serata capitano — aprirebbero il circuito
+          # verso payment-service e toglierebbero la possibilita' di pagare
+          # a TUTTI gli altri clienti.
+          #
+          # Il servizio, in quel momento, sta funzionando perfettamente: il
+          # circuit breaker sorveglia i guasti, non le risposte spiacevoli.
+          # =================================================================
+          - it.its.cinema.bookingservice.domain.PagamentoRifiutatoException
 
     # Un breaker PER SERVIZIO, mai uno globale: pricing in ginocchio non deve
     # chiudere il circuito verso shows, che sta benissimo.
@@ -179,9 +199,10 @@ resilience4j:
         baseConfig: default
       pricing:
         baseConfig: default
-      # Ci sono gia' e oggi non li usa nessuno: i due servizi del G8. Averli
-      # qui costa una riga e rende il G8 una modifica di codice, non di
-      # configurazione.
+      # PASSO 8.1 e 8.2 — c'erano gia' dal G7, quando non li usava nessuno.
+      # Averli scritti in anticipo ha reso il G8 una modifica di codice e non
+      # di configurazione: e' la stessa idea di ShowsClient.rilascia, scritto
+      # al G6 e chiamato per la prima volta oggi.
       payment:
         baseConfig: default
       loyalty:
@@ -221,23 +242,41 @@ resilience4j:
         retryExceptions:
           - it.its.cinema.bookingservice.domain.ServizioNonDisponibileException
 
-    # ATTENZIONE, QUI C'E' UNA COSA CHE MANCA ED E' VOLUTO (passo 7.3).
+    # =======================================================================
+    # PASSO 8.3 — COSA E' CAMBIATO QUI DAL G7, E COSA NO.
     #
-    # Le istanze ci sono, ma il retry non e' attaccato a TUTTE le chiamate:
-    # lo si annota solo dove RIPETERE E' SICURO (vedi ShowsClient).
-    # GET /shows/{id} e POST /prices/quote sono letture e calcoli puri:
-    # ripeterli non cambia niente in nessun posto. POST /shows/{id}/reserve
-    # cambia lo stato di un altro servizio e oggi NON e' idempotente: un
-    # timeout dopo che i posti sono gia' stati scalati, ritentato, li scala
-    # una seconda volta. Il retry lo si potra' accendere al G8, quando
-    # shows-service riconoscera' il sagaId gia' visto.
+    # Al G7 il retry era attaccato SOLO alle letture e ai calcoli puri, e il
+    # commento diceva che POST /shows/{id}/reserve lo avrebbe avuto al G8,
+    # "quando shows-service riconoscera' il sagaId gia' visto".
     #
-    # E nessun retry su payment, mai: un pagamento rifiutato e' una risposta
-    # di dominio, e ritentarla la rende solo sbagliata tre volte.
+    # E' successo: shows-service ha la sua tabella show_operations con
+    # UNIQUE (saga_id, operation_type), quindi riserva e rilascia sono
+    # diventate ripetibili e in ShowsClient hanno il loro @Retry. Lo stesso
+    # vale per loyalty, che nasce idempotente.
+    #
+    # LA REGOLA NON E' CAMBIATA: si ritenta cio' che e' IDEMPOTENTE. E'
+    # cambiato il fatto che adesso lo sia — e il lavoro per renderlo tale e'
+    # stato fatto dall'altra parte del filo. Un retry non si accende perche'
+    # fa comodo a chi chiama.
+    #
+    # E PAYMENT NON HA UN'ISTANZA, ED E' L'UNICO: e' la regola del passo 7.3,
+    # tenuta anche adesso che payment-service sarebbe tecnicamente
+    # idempotente (UNIQUE su saga_id). Con i soldi il margine si tiene largo:
+    # un'autorizzazione di cui non si conosce l'esito si riconcilia
+    # guardando, non ritentando al buio. La saga compensa e il cliente
+    # riprova, con una chiave nuova e un esito che qualcuno ha visto.
+    #
+    # Senza istanza configurata, un @Retry(name = "payment") scritto per
+    # distrazione userebbe la configurazione default — quindi la mancanza
+    # qui NON e' una protezione: la protezione e' che in PaymentClient quelle
+    # annotazioni non ci sono, e c'e' un test che lo verifica.
+    # =======================================================================
     instances:
       shows:
         baseConfig: default
       pricing:
+        baseConfig: default
+      loyalty:
         baseConfig: default
 
 springdoc:

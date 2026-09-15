@@ -2,9 +2,11 @@ package it.its.cinema.bookingservice.web.dto;
 
 import io.swagger.v3.oas.annotations.media.Schema;
 import it.its.cinema.bookingservice.domain.CustomerType;
+import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.Size;
 
 /**
  * PASSO 6.10 — CIO' CHE IL CLIENT PUO' DECIDERE, E NIENT'ALTRO.
@@ -28,6 +30,26 @@ public record CreateBookingRequest(
         @Schema(description = "Identificativo dello spettacolo su shows-service",
                 example = "1", requiredMode = Schema.RequiredMode.REQUIRED)
         Long showId,
+
+        /**
+         * PASSO 8.2 — CHI STA COMPRANDO, e dal G8 serve davvero.
+         *
+         * Fino al G7 non c'era: una prenotazione non aveva bisogno di sapere
+         * chi fosse il cliente. Dal G8 si': i punti fedelta' vanno accreditati
+         * a qualcuno, e — soprattutto — vanno STORNATI a qualcuno quando la
+         * saga compensa.
+         *
+         * Che arrivi dal client e' una semplificazione da aula, ed e' bene
+         * dirlo: in un sistema vero l'identita' di chi compra si prende dal
+         * token di autenticazione e non si accetta dal corpo della richiesta,
+         * altrimenti chiunque puo' accreditare punti sul conto di un altro.
+         * E' il G9, quando arrivera' il gateway.
+         */
+        @NotBlank(message = "Il cliente e' obbligatorio")
+        @Size(max = 64, message = "Il cliente non puo' superare i 64 caratteri")
+        @Schema(description = "Identificativo del cliente, per i punti fedelta'",
+                example = "mario.rossi", requiredMode = Schema.RequiredMode.REQUIRED)
+        String customerId,
 
         /**
          * L'enum nella firma: un valore non previsto non arriva al service.

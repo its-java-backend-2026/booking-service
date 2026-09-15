@@ -5,6 +5,7 @@ import java.time.LocalDateTime;
 
 import it.its.cinema.bookingservice.domain.Booking;
 import it.its.cinema.bookingservice.domain.CustomerType;
+import it.its.cinema.bookingservice.domain.PagamentoRifiutatoException;
 import it.its.cinema.bookingservice.domain.PostiEsauritiException;
 import it.its.cinema.bookingservice.domain.ServizioNonDisponibileException;
 import it.its.cinema.bookingservice.domain.SpettacoloNonTrovatoException;
@@ -70,8 +71,11 @@ class BookingControllerTest {
     BookingService service;
 
     private static final String CORPO = """
-            {"showId": 1, "customerType": "STUDENT", "quantity": 2}
+            {"showId": 1, "customerId": "mario.rossi", "customerType": "STUDENT", "quantity": 2}
             """;
+
+    /** PASSO 8.2 — dal G8 la prenotazione sa a chi accreditare i punti. */
+    private static final String CLIENTE = "mario.rossi";
 
     /** PASSO 7.6 — la chiave che il client ripete a ogni tentativo. */
     private static final String CHIAVE = "8f14e45f-ceea-467a-9c7e-8a0b1f2d3c4e";
@@ -85,7 +89,7 @@ class BookingControllerTest {
     @Test
     @DisplayName("201 con Location, e il totale calcolato dal dominio")
     void creazioneRiuscita() throws Exception {
-        when(service.crea(eq(CHIAVE), eq(1L), eq(CustomerType.STUDENT), eq(2)))
+        when(service.crea(eq(CHIAVE), eq(1L), eq(CLIENTE), eq(CustomerType.STUDENT), eq(2)))
                 .thenReturn(new EsitoPrenotazione(prenotazione(), false));
 
         mockMvc.perform(post("/bookings")
@@ -111,7 +115,7 @@ class BookingControllerTest {
     @Test
     @DisplayName("Il 404 di shows-service resta un 404")
     void spettacoloInesistente() throws Exception {
-        when(service.crea(anyString(), any(), any(), anyInt()))
+        when(service.crea(anyString(), any(), anyString(), any(), anyInt()))
                 .thenThrow(new SpettacoloNonTrovatoException(99L));
 
         mockMvc.perform(post("/bookings")
@@ -126,7 +130,7 @@ class BookingControllerTest {
     @Test
     @DisplayName("Il 409 di shows-service resta un 409, non diventa un 400")
     void postiEsauriti() throws Exception {
-        when(service.crea(anyString(), any(), any(), anyInt()))
+        when(service.crea(anyString(), any(), anyString(), any(), anyInt()))
                 .thenThrow(new PostiEsauritiException(1L, 2));
 
         mockMvc.perform(post("/bookings")
@@ -147,7 +151,7 @@ class BookingControllerTest {
     @Test
     @DisplayName("Un servizio a valle giu' e' un 503 con Retry-After, MAI un 500")
     void servizioAValleGiu() throws Exception {
-        when(service.crea(anyString(), any(), any(), anyInt()))
+        when(service.crea(anyString(), any(), anyString(), any(), anyInt()))
                 .thenThrow(new ServizioNonDisponibileException("pricing-service",
                         "HttpConnectTimeoutException: HTTP connect timed out"));
 
@@ -201,23 +205,24 @@ class BookingControllerTest {
     @Test
     @DisplayName("Un prezzo mandato dal client viene ignorato, non accettato")
     void ilPrezzoDalClientVieneIgnorato() throws Exception {
-        when(service.crea(eq(CHIAVE), eq(1L), eq(CustomerType.STUDENT), eq(2)))
+        when(service.crea(eq(CHIAVE), eq(1L), eq(CLIENTE), eq(CustomerType.STUDENT), eq(2)))
                 .thenReturn(new EsitoPrenotazione(prenotazione(), false));
 
         mockMvc.perform(post("/bookings")
                         .header("Idempotency-Key", CHIAVE)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"showId": 1, "customerType": "STUDENT", "quantity": 2,
+                                {"showId": 1, "customerId": "mario.rossi",
+                                 "customerType": "STUDENT", "quantity": 2,
                                  "unitPrice": 0.01, "totalPrice": 0.02}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.unitPrice").value(10.00))
                 .andExpect(jsonPath("$.totalPrice").value(20.00));
 
-        // il service riceve i tre campi veri, e nient'altro
+        // il service riceve i quattro campi veri, e nient'altro
         verify(service, org.mockito.Mockito.atLeastOnce())
-                .crea(CHIAVE, 1L, CustomerType.STUDENT, 2);
+                .crea(CHIAVE, 1L, CLIENTE, CustomerType.STUDENT, 2);
     }
 
     // =====================================================================
@@ -258,7 +263,7 @@ class BookingControllerTest {
     @Test
     @DisplayName("Una chiave gia' vista risponde 200, non 201 e nemmeno 409")
     void chiaveRipetutaRisponde200() throws Exception {
-        when(service.crea(eq(CHIAVE), eq(1L), eq(CustomerType.STUDENT), eq(2)))
+        when(service.crea(eq(CHIAVE), eq(1L), eq(CLIENTE), eq(CustomerType.STUDENT), eq(2)))
                 .thenReturn(new EsitoPrenotazione(prenotazione(), true));
 
         mockMvc.perform(post("/bookings")
@@ -280,7 +285,7 @@ class BookingControllerTest {
     @Test
     @DisplayName("Una chiave troppo lunga e' un 400, non un 500")
     void chiaveTroppoLungaE400() throws Exception {
-        when(service.crea(anyString(), any(), any(), anyInt()))
+        when(service.crea(anyString(), any(), anyString(), any(), anyInt()))
                 .thenThrow(new IllegalArgumentException(
                         "L'header Idempotency-Key non puo' superare i 64 caratteri"));
 
@@ -290,5 +295,62 @@ class BookingControllerTest {
                         .content(CORPO))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.title").value("Richiesta non valida"));
+    }
+
+    /**
+     * PASSO 8.8 — IL 402, E CIO' CHE IL CORPO RACCONTA OLTRE AL CODICE.
+     *
+     * E' l'esito nuovo del G8, e ce n'e' uno solo che conta davvero: il
+     * client deve capire che non ha comprato E che non ha lasciato niente in
+     * sospeso. Il campo "compensata" nel corpo e' quello che lo dice.
+     */
+    @Test
+    @DisplayName("Pagamento rifiutato: 402, con il motivo e la conferma che si e' compensato")
+    void pagamentoRifiutatoE402() throws Exception {
+        when(service.crea(anyString(), any(), anyString(), any(), anyInt()))
+                .thenThrow(new PagamentoRifiutatoException("saga-1",
+                        "Importo 200.00 oltre la soglia autorizzabile di 100.00"));
+
+        mockMvc.perform(post("/bookings")
+                        .header("Idempotency-Key", CHIAVE)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(CORPO))
+                .andExpect(status().isPaymentRequired())
+                .andExpect(jsonPath("$.title").value("Pagamento rifiutato"))
+                .andExpect(jsonPath("$.detail").value(
+                        "Pagamento rifiutato: Importo 200.00 oltre la soglia autorizzabile di 100.00"))
+                .andExpect(jsonPath("$.sagaId").value("saga-1"))
+                .andExpect(jsonPath("$.compensata").value(true));
+    }
+
+    @Test
+    @DisplayName("PASSO 8.2 — senza customerId e' un 400: i punti vanno dati a qualcuno")
+    void senzaClienteE400() throws Exception {
+        mockMvc.perform(post("/bookings")
+                        .header("Idempotency-Key", CHIAVE)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"showId": 1, "customerType": "STUDENT", "quantity": 2}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.title").value("Dati non validi"));
+
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @DisplayName("PASSO 8.4 — lo stato della prenotazione esce nella risposta")
+    void loStatoEsceNellaRisposta() throws Exception {
+        Booking confermata = prenotazione();
+        confermata.conferma();
+        when(service.crea(eq(CHIAVE), eq(1L), eq(CLIENTE), eq(CustomerType.STUDENT), eq(2)))
+                .thenReturn(new EsitoPrenotazione(confermata, false));
+
+        mockMvc.perform(post("/bookings")
+                        .header("Idempotency-Key", CHIAVE)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(CORPO))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.stato").value("CONFERMATA"));
     }
 }

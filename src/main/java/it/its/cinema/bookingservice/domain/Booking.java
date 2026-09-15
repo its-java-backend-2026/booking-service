@@ -134,6 +134,26 @@ public class Booking {
     private LocalDateTime createdAt;
 
     /**
+     * PASSO 8.4 — LO STATO, CHE PRIMA DEL G8 NON SERVIVA.
+     *
+     * Fino al G7 una prenotazione o veniva salvata o non esisteva: la INSERT
+     * era l'ultimo passo, e arrivarci significava che era andato tutto bene.
+     *
+     * Dal G8 la riga si scrive PRIMA delle chiamate agli altri servizi — e
+     * non e' un capriccio, e' necessario: il pagamento vuole il bookingId, e
+     * per averlo la riga deve gia' esistere. Da quel momento esiste un
+     * intervallo, lungo quanto tre chiamate di rete, in cui la prenotazione
+     * c'e' ma l'acquisto non e' concluso.
+     *
+     * Quell'intervallo va chiamato per nome, altrimenti chiunque legga la
+     * tabella — un elenco, un report, un lavoro periodico — conta come
+     * vendute delle prenotazioni che nessuno ha ancora pagato.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
+    private StatoPrenotazione stato;
+
+    /**
      * Il costruttore valida, come in Show (passo 4.1): il DTO difende il
      * confine HTTP, questo difende l'oggetto da CHIUNQUE lo costruisca —
      * un test, un importatore, il service del G8. Chi entra da una porta
@@ -188,5 +208,34 @@ public class Booking {
         this.unitPrice = unitPrice;
         this.totalPrice = unitPrice.multiply(BigDecimal.valueOf(quantity));
         this.createdAt = LocalDateTime.now();
+
+        // Nasce IN_CORSO, e non CONFERMATA: al G8 la riga viene scritta
+        // prima che i posti siano scalati e prima che il pagamento sia
+        // passato. Il costruttore non puo' promettere un acquisto che non
+        // e' ancora avvenuto.
+        this.stato = StatoPrenotazione.IN_CORSO;
+    }
+
+    /**
+     * PASSO 8.5 — tutti i passi sono riusciti: da qui e' un biglietto.
+     */
+    public void conferma() {
+        this.stato = StatoPrenotazione.CONFERMATA;
+    }
+
+    /**
+     * PASSO 8.5 — la saga e' fallita e ha compensato.
+     *
+     * La riga NON si cancella. Cancellarla sarebbe piu' pulito da guardare e
+     * toglierebbe l'unica risposta alla domanda "ho provato a comprare e non
+     * ha funzionato, cosa e' successo?" — che e' la domanda che il cliente fa
+     * il giorno dopo, quando di quel tentativo non resta piu' nient'altro.
+     */
+    public void fallisci() {
+        this.stato = StatoPrenotazione.FALLITA;
+    }
+
+    public boolean confermata() {
+        return stato == StatoPrenotazione.CONFERMATA;
     }
 }

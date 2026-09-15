@@ -60,10 +60,25 @@ public class BookingController {
      *
      * I quattro esiti, e perche' sono quelli:
      *
-     *   201  fatto: posti scalati, prenotazione salvata, Location valorizzata
+     *   201  fatto: posti scalati, pagamento autorizzato, punti accreditati
      *   404  lo spettacolo non esiste          (il 404 di shows, passo 6.9)
      *   409  i posti non bastano               (il 409 di shows, passo 6.9)
+     *   402  il pagamento e' stato rifiutato   (il 402 di payment, passo 8.1)
      *   503  un servizio a valle non risponde  (5xx o timeout, NON un 500)
+     *
+     * =======================================================================
+     * PASSO 8.8 — I DUE ULTIMI SONO DIVERSI DA TUTTI GLI ALTRI, E IL
+     * CONTROLLER NON SE NE ACCORGE.
+     *
+     * Un 404 o un 409 arrivano prima che sia successo qualcosa. Un 402 e un
+     * 503 possono arrivare DOPO che i posti sono stati scalati e il
+     * pagamento e' passato: quando il client li riceve, la saga ha gia'
+     * rimesso tutto a posto (passo 8.7).
+     *
+     * Che qui non si veda e' il segno che gli strati sono al posto giusto:
+     * la compensazione e' un fatto del service, e il controller continua a
+     * tradurre eccezioni in codici come faceva al G1.
+     * =======================================================================
      */
     @Operation(summary = "Prenota dei posti",
             description = "Legge lo spettacolo da shows-service, chiede il prezzo a "
@@ -89,8 +104,14 @@ public class BookingController {
             @ApiResponse(responseCode = "409", description = "Posti insufficienti",
                     content = @Content(mediaType = "application/problem+json",
                             schema = @Schema(implementation = ProblemDetail.class))),
+            @ApiResponse(responseCode = "402",
+                    description = "Pagamento rifiutato: la saga ha compensato, "
+                            + "i posti sono tornati disponibili",
+                    content = @Content(mediaType = "application/problem+json",
+                            schema = @Schema(implementation = ProblemDetail.class))),
             @ApiResponse(responseCode = "503",
-                    description = "shows-service o pricing-service non hanno risposto",
+                    description = "un servizio a valle non ha risposto. Se era gia' stato "
+                            + "fatto qualcosa, la saga ha compensato",
                     content = @Content(mediaType = "application/problem+json",
                             schema = @Schema(implementation = ProblemDetail.class)))
     })
@@ -107,6 +128,7 @@ public class BookingController {
         EsitoPrenotazione esito = service.crea(
                 chiaveIdempotenza,
                 richiesta.showId(),
+                richiesta.customerId(),
                 richiesta.customerType(),
                 richiesta.quantity());
 

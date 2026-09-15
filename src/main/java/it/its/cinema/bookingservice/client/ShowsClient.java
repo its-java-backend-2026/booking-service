@@ -53,26 +53,37 @@ import org.springframework.web.client.RestClient;
  * importante del G7 e non si legge in nessuna configurazione:
  *
  *   perId()     GET, una lettura.                @CircuitBreaker + @Retry
- *   riserva()   POST che SCALA dei posti.        @CircuitBreaker, e basta
- *   rilascia()  POST che RIMETTE dei posti.      @CircuitBreaker, e basta
+ *   riserva()   POST che SCALA dei posti.        @CircuitBreaker + @Retry (dal G8)
+ *   rilascia()  POST che RIMETTE dei posti.      @CircuitBreaker + @Retry (dal G8)
  *
  * La regola e' l'IDEMPOTENZA, non "e' una GET". Ripetere una lettura non
- * cambia niente da nessuna parte; ripetere una riserva scala i posti una
- * seconda volta — e il caso in cui il retry scatta e' esattamente quello in
- * cui il danno e' piu' probabile: il TIMEOUT. Timeout non vuol dire "non e'
- * arrivata": vuol dire "non so se e' arrivata". Il piu' delle volte lo
- * spettacolo ha gia' scalato i posti e sta solo rispondendo piano.
+ * cambia niente da nessuna parte; ripetere una riserva — fino al G7 —
+ * scalava i posti una seconda volta, e il caso in cui il retry scatta era
+ * esattamente quello in cui il danno era piu' probabile: il TIMEOUT. Timeout
+ * non vuol dire "non e' arrivata": vuol dire "non so se e' arrivata". Il piu'
+ * delle volte lo spettacolo ha gia' scalato i posti e sta solo rispondendo
+ * piano.
  *
- * Ritentare li' significa vendere due volte le stesse poltrone, in silenzio,
- * e scoprirlo la sera della proiezione con due persone sulla stessa fila.
+ * ---------------------------------------------------------------------------
+ * PASSO 8.3 — E OGGI QUEL RETRY SI ACCENDE, COME ERA STATO SCRITTO AL G7.
  *
- * Il retry su riserva() si accendera' al G8, quando shows-service riconoscera'
- * il sagaId gia' visto e la seconda chiamata non fara' piu' niente. Il sagaId
- * viaggia gia' oggi (passo 6.4): e' meta' del lavoro, fatta in anticipo.
+ * shows-service ha la sua tabella show_operations con UNIQUE (saga_id,
+ * operation_type): la seconda chiamata con lo stesso sagaId non fa niente e
+ * risponde come la prima. Ripetere e' diventato gratis, quindi il retry e'
+ * diventato sicuro — e le due righe di @Retry qui sotto sono tutto cio' che
+ * serviva ad accenderlo.
  *
- * Il BREAKER invece sta su tutti e tre, e non ha lo stesso problema: non
- * riesegue niente, si limita a non tentare. Rifiutarsi di chiamare non ha mai
- * effetti collaterali.
+ * Vale la pena fermarsi un secondo su cosa e' successo davvero: NON abbiamo
+ * cambiato idea sulla regola. La regola e' sempre "si ritenta cio' che e'
+ * idempotente". E' cambiato il fatto che adesso lo e' — e il lavoro per
+ * renderlo tale e' stato fatto dall'ALTRA parte del filo. Un retry non si
+ * accende perche' fa comodo a chi chiama: si accende quando chi risponde
+ * puo' sostenerlo.
+ * ---------------------------------------------------------------------------
+ *
+ * Il BREAKER invece sta su tutti e tre da sempre, e non ha mai avuto lo
+ * stesso problema: non riesegue niente, si limita a non tentare. Rifiutarsi
+ * di chiamare non ha mai effetti collaterali.
  * ===========================================================================
  */
 @Component
@@ -128,14 +139,19 @@ public class ShowsClient {
      * a noi serve solo sapere che e' andata bene. Cio' che conta e' che
      * questo metodo o ritorna, o solleva: non esiste un "forse".
      *
-     * NIENTE @Retry, E NON E' UNA DIMENTICANZA (passo 7.3).
+     * PASSO 8.3 — E DAL G8 HA IL @Retry, che al G7 non poteva avere.
      *
-     * Questo POST scala dei posti in un altro servizio, e shows-service oggi
-     * NON riconosce un sagaId gia' visto: ritentarlo dopo un timeout
-     * scalerebbe i posti una seconda volta. Il breaker invece c'e': rifiutarsi
-     * di chiamare non ha effetti collaterali, rieseguire si'.
+     * Questo POST scala dei posti in un altro servizio. Fino a ieri
+     * shows-service non riconosceva un sagaId gia' visto, quindi ritentarlo
+     * dopo un timeout scalava i posti una seconda volta; da oggi la seconda
+     * chiamata non fa niente (show_operations, V5) e il retry e' sicuro.
+     *
+     * E' il debito del G7 che viene ripagato: la riga di codice e' una sola,
+     * ma e' arrivata dopo una migrazione, una tabella e una transazione
+     * nell'altro servizio.
      */
     @CircuitBreaker(name = "shows", fallbackMethod = "riservaNonDisponibile")
+    @Retry(name = "shows")
     public void riserva(Long showId, int quantita, String sagaId) {
         eseguendo("POST /shows/" + showId + "/reserve", () -> http.post()
                 .uri("/shows/{id}/reserve", showId)
@@ -163,20 +179,21 @@ public class ShowsClient {
     /**
      * LA COMPENSAZIONE del passo 3: rimette i posti a disposizione.
      *
-     * Oggi (G6) NON la chiama nessuno, ed e' voluto che sia cosi': il passo
-     * 6.10 si ferma prima, e il buco che resta e' il problema del G8. Il
-     * metodo c'e' perche' e' la meta' mancante del contratto di reserve, e
-     * perche' averlo gia' pronto rende il G8 una riga di orchestrazione
-     * invece di un capitolo nuovo.
+     * Scritta al G6 e rimasta senza chiamanti per due giornate, di proposito:
+     * il passo 6.10 si fermava prima, e il buco che restava era il problema
+     * del G8. Da oggi la chiama BookingSaga.compensa (passo 8.7), ed e'
+     * bastata una riga di orchestrazione perche' il metodo era gia' qui.
      *
      * Nota: non solleva PostiEsauriti (rilasciare non puo' esaurire niente)
-     * e ignora il 404 con la stessa logica delle compensazioni: se lo
+     * e ignora il 404 con la stessa logica di tutte le compensazioni: se lo
      * spettacolo non c'e' piu', non c'e' niente da rimettere a posto.
      *
-     * Come riserva(), niente @Retry: anche rimettere a posto due volte e' un
-     * errore, e in piu' e' quello che si nota meno — dei posti in regalo.
+     * PASSO 8.3 — come riserva(), ha il @Retry dal G8: "rilascia 2 posti"
+     * eseguito due volte ne rilascia 2, non 4. Ed e' il caso in cui ripetere
+     * si nota MENO — dei posti in regalo non fanno arrabbiare nessuno subito.
      */
     @CircuitBreaker(name = "shows", fallbackMethod = "rilascioNonDisponibile")
+    @Retry(name = "shows")
     public void rilascia(Long showId, int quantita, String sagaId) {
         eseguendo("POST /shows/" + showId + "/release", () -> http.post()
                 .uri("/shows/{id}/release", showId)

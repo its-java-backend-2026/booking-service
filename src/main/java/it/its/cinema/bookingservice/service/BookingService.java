@@ -1,6 +1,7 @@
 package it.its.cinema.bookingservice.service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -20,62 +21,39 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * PASSO 6.10 — IL FLUSSO DI POST /bookings, CHE ATTRAVERSA TRE PROCESSI.
+ * PASSO 8.5 — IL FLUSSO DI POST /bookings, CHE ORA ATTRAVERSA CINQUE PROCESSI.
  *
- *     1. GET  shows-service   /shows/{id}       prezzo base, orario, titolo
- *     2. POST pricing-service /prices/quote     prezzo unitario
- *     3. POST shows-service   /shows/{id}/reserve
- *     4. salva su booking_db                    -> 201 Created
- *
- * ===========================================================================
- * GUARDATE IL PASSO 3, ED E' IL PUNTO PIU' IMPORTANTE DI TUTTA LA GIORNATA.
- *
- * Se il passo 4 fallisce — il database e' pieno, la connessione cade, il
- * processo viene ucciso fra il 3 e il 4 — I POSTI RESTANO RISERVATI. Sono
- * stati scalati in un altro servizio, dentro una transazione che si e' gia'
- * chiusa con successo, e la nostra non ha nessun potere su quella.
- *
- * Il cliente riceve un errore e non ha nessuna prenotazione; il cinema ha
- * due poltrone in meno da vendere, per sempre, e nessuno lo sa.
- *
- * NON SI RISOLVE CON UNA TRANSAZIONE PIU' GRANDE. La tentazione e' mettere
- * @Transactional su questo metodo e sperare: non funziona, perche' una
- * transazione locale non puo' annullare un POST HTTP gia' arrivato a
- * destinazione. Non esiste il rollback distribuito, o meglio esiste (XA,
- * two-phase commit) e nei microservizi non si usa, perche' tiene bloccate le
- * risorse di tutti i partecipanti per tutta la durata dell'operazione.
- *
- * La soluzione e' la SAGA: ogni passo ha una compensazione, e chi coordina
- * la esegue quando un passo successivo fallisce. ShowsClient.rilascia() e'
- * gia' scritto e oggi non lo chiama nessuno, di proposito. E' il G8.
- *
- * Oggi ci si ferma qui, con il buco in vista e il commento che lo dice:
- * un problema che si e' visto succedere si risolve meglio di uno raccontato.
- * ===========================================================================
+ *     0. l'ho gia' vista?                    (idempotenza, passo 7.6)
+ *     1. GET  shows-service   /shows/{id}    prezzo base, orario, titolo
+ *     2. POST pricing-service /prices/quote  prezzo unitario
+ *     3. la prenotazione IN_CORSO e la saga AVVIATA               <- SagaStore
+ *     4. la saga: posti, pagamento, punti                         <- BookingSaga
  *
  * ===========================================================================
- * PASSO 7.6 — E DAL G7, PRIMA DI TUTTO QUESTO, UNA DOMANDA SOLA:
- * "QUESTA RICHIESTA L'HO GIA' VISTA?"
+ * COSA E' CAMBIATO DAL G7, E PERCHE' L'ORDINE E' DIVERSO.
  *
- * Il caso da cui difendersi non e' teorico ed e' il piu' comune di tutti:
- * l'utente preme "Paga", la rete rallenta, la risposta non arriva, l'utente
- * preme di nuovo. Senza idempotenza sono due prenotazioni e due addebiti; il
- * cliente se ne accorge, e non da noi.
+ * Al G6 e al G7 la riga si scriveva ALLA FINE, dopo aver riservato i posti.
+ * Era il buco dichiarato in cima a questa classe per due giornate: se la
+ * INSERT falliva, i posti restavano scalati e nessuno lo sapeva.
  *
- * La difesa e' in due tempi, e servono ENTRAMBI:
+ * Adesso la riga si scrive PRIMA, e cambia due cose:
  *
- *   PRIMA   si cerca la chiave. Se c'e', si restituisce la prenotazione di
- *           allora senza chiamare nessuno. E' il caso normale, e risparmia
- *           tre chiamate HTTP a ogni doppio clic.
+ *   1. IL BUCO SI CHIUDE. Da quando i posti vengono scalati esiste gia' una
+ *      riga che dice che qualcuno li ha presi, e una saga che sa come
+ *      rimetterli a posto. Il caso "il database rifiuta la INSERT dopo aver
+ *      scalato i posti" non esiste piu': se il database rifiuta, e' prima
+ *      che i posti siano toccati.
  *
- *   DOPO    si salva, e si accetta che il vincolo UNIQUE possa dire di no.
- *           Due richieste arrivate INSIEME superano tutte e due il controllo
- *           di prima: a quel punto decide il database, che e' l'unico posto
- *           che tutte le istanze del servizio condividono.
+ *   2. LA CORSA SULL'IDEMPOTENZA SI RISOLVE PRIMA. Il vincolo UNIQUE su
+ *      idempotency_key ora scatta PRIMA di qualsiasi chiamata: due doppi
+ *      clic simultanei non arrivano nemmeno a riservare i posti. Al G7 la
+ *      corsa si perdeva DOPO, e il commento di allora lo diceva — "i posti
+ *      riservati da questo tentativo restano scalati (compensazione al G8)".
+ *      Non c'e' piu' niente da compensare, perche' non c'e' piu' niente da
+ *      scalare.
  *
- * La violazione del vincolo NON e' un errore da propagare: e' la risposta
- * "l'ha gia' fatto qualcun altro". Si rilegge la riga vincente e si
- * restituisce quella — chi ha chiamato voleva una prenotazione, e ce l'ha.
+ * Non e' un dettaglio di ordine: e' che scrivere il fatto PRIMA di agire
+ * fuori e' l'unico modo di sapere, dopo, che cosa si era cominciato.
  * ===========================================================================
  */
 @Service
@@ -86,24 +64,29 @@ public class BookingService {
     private final BookingRepository repository;
     private final ShowsClient showsClient;
     private final PricingClient pricingClient;
+    private final SagaStore store;
+    private final BookingSaga saga;
 
     /**
-     * QUI NON C'E' @Transactional, ED E' UNA SCELTA.
+     * QUI NON C'E' @Transactional, ED E' UNA SCELTA — ORA PER TRE MOTIVI.
      *
-     * Metterla significherebbe tenere aperta una transazione sul database —
-     * e quindi una connessione del pool occupata — per tutta la durata di
-     * TRE chiamate HTTP. Con i timeout del passo 6.6 sono fino a 9 secondi
-     * per prenotazione: bastano una decina di richieste lente insieme per
-     * esaurire il pool, e a quel punto anche le GET smettono di rispondere.
+     * 1. Non si tiene aperta una transazione — e quindi una connessione del
+     *    pool — durante delle chiamate di rete. Con i timeout del passo 6.6
+     *    e i cinque servizi del G8 sarebbero fino a quindici secondi per
+     *    prenotazione: bastano dieci richieste lente insieme per esaurire il
+     *    pool, e a quel punto anche le GET smettono di rispondere.
      *
-     * E' la stessa lezione di open-in-view: false del G2, vista da un'altra
-     * angolazione. Una transazione si apre il piu' tardi possibile e si
-     * chiude il prima possibile, e MAI intorno a un'attesa di rete.
+     * 2. La violazione del vincolo UNIQUE dev'essere trattata come una
+     *    RISPOSTA (passo 7.6) e non come un errore. Dentro una transazione
+     *    non si puo': la violazione la marca rollback-only, e la rilettura
+     *    della riga vincente morirebbe al commit con
+     *    UnexpectedRollbackException — un messaggio che non nomina nessun
+     *    vincolo e manda a cercare nel posto sbagliato.
      *
-     * Qui non serve: fino al passo 4 non si tocca il database, e il passo 4
-     * e' una singola INSERT, che la sua transazione ce l'ha da sola.
+     * 3. Le scritture che DEVONO essere atomiche stanno in SagaStore, che e'
+     *    un bean a parte con le sue transazioni corte (passo 8.6).
      */
-    public EsitoPrenotazione crea(String chiaveIdempotenza, Long showId,
+    public EsitoPrenotazione crea(String chiaveIdempotenza, Long showId, String customerId,
                                   CustomerType customerType, int quantita) {
 
         String chiave = validata(chiaveIdempotenza);
@@ -112,65 +95,45 @@ public class BookingService {
         // Il controllo APPLICATIVO: copre il caso normale (l'utente ha
         // premuto due volte a distanza di secondi) senza disturbare nessuno.
         // Non copre le due richieste arrivate nello stesso millisecondo: per
-        // quelle c'e' il vincolo UNIQUE, in fondo al metodo.
+        // quelle c'e' il vincolo UNIQUE, al passo 3.
         Optional<Booking> gia = repository.findByIdempotencyKey(chiave);
         if (gia.isPresent()) {
-            log.info("Idempotency-Key {} gia' vista: restituisco la prenotazione {} "
-                    + "senza chiamare nessuno", chiave, gia.get().getId());
+            log.info("Idempotency-Key {} gia' vista: restituisco la prenotazione {} ({}) "
+                    + "senza chiamare nessuno", chiave, gia.get().getId(), gia.get().getStato());
             return EsitoPrenotazione.ripetuta(gia.get());
         }
 
         // L'identificativo dell'intera operazione, generato UNA VOLTA e
-        // ripetuto identico a ogni servizio coinvolto. E' cio' che permette
-        // di ricucire i log di tre processi diversi, e dal G8 e' la chiave
-        // dell'idempotenza verso gli ALTRI servizi.
+        // ripetuto identico a ogni servizio coinvolto. Dal G8 non serve piu'
+        // solo a ricucire i log: e' la CHIAVE DI IDEMPOTENZA con cui ognuno
+        // dei tre partecipanti riconosce un passo gia' eseguito (passo 8.3).
         //
         // Nuovo a ogni TENTATIVO, mentre la chiave qui sopra e' la stessa a
         // ogni ripetizione della stessa INTENZIONE: e' la differenza che
         // rende utili tutti e due.
         String sagaId = UUID.randomUUID().toString();
-        log.info("[saga {}] inizio prenotazione: spettacolo {}, {} posti, categoria {}",
-                sagaId, showId, quantita, customerType);
+        log.info("[saga {}] inizio prenotazione: spettacolo {}, {} posti, categoria {}, cliente {}",
+                sagaId, showId, quantita, customerType, customerId);
 
         // --- 1. i dati dello spettacolo ---
-        // Serve il prezzo base, l'orario e il titolo. E' anche il momento in
-        // cui si scopre che lo spettacolo non esiste: il 404 di shows diventa
-        // un 404 nostro (passo 6.9) invece di una riga orfana sul database.
         ShowJson spettacolo = showsClient.perId(showId);
 
         // --- 2. il prezzo unitario ---
         // eveningShow lo decide CHI CONOSCE L'ORARIO, cioe' shows-service:
-        // noi lo ritrasmettiamo e non lo ricalcoliamo. Ricalcolarlo qui
-        // vorrebbe dire duplicare la regola "dalle 20:00 in poi" in due
-        // servizi, e il giorno in cui cambiasse ne cambierebbe una sola.
+        // noi lo ritrasmettiamo e non lo ricalcoliamo.
         BigDecimal prezzoUnitario = pricingClient.prezzoUnitario(
                 spettacolo.basePrice(), customerType, spettacolo.eveningShow());
 
-        // --- 3. la riserva dei posti ---
-        // E' il primo passo IRREVERSIBILE: da qui in poi qualcosa e' cambiato
-        // in un altro servizio. Un 409 qui e' del tutto normale — fra il
-        // passo 1 e questo c'e' una finestra in cui chiunque puo' comprare gli
-        // ultimi posti — e diventa un 409 anche per il nostro chiamante.
-        showsClient.riserva(showId, quantita, sagaId);
+        Booking nuova = new Booking(
+                chiave, sagaId, showId, customerType, quantita,
+                spettacolo.movieTitle(),   // passo 6.3: copiati, non referenziati
+                spettacolo.startTime(),
+                prezzoUnitario);
 
-        // --- 4. il fatto storico ---
-        // Da qui in avanti la prenotazione esiste. Se questa riga fallisce,
-        // i posti del passo 3 restano riservati: vedi il commento in cima.
+        // --- 3. la prenotazione IN_CORSO e la saga AVVIATA ---
+        AperturaSaga apertura;
         try {
-            Booking prenotazione = repository.save(new Booking(
-                    chiave,
-                    sagaId,
-                    showId,
-                    customerType,
-                    quantita,
-                    spettacolo.movieTitle(),   // passo 6.3: copiati, non referenziati
-                    spettacolo.startTime(),
-                    prezzoUnitario));
-
-            log.info("[saga {}] prenotazione {} creata: {} x {} = {}",
-                    sagaId, prenotazione.getId(), quantita, prezzoUnitario,
-                    prenotazione.getTotalPrice());
-            return EsitoPrenotazione.creata(prenotazione);
+            apertura = store.apri(nuova, customerId, puntiFedelta(nuova.getTotalPrice()));
 
         } catch (DataIntegrityViolationException e) {
             // ===============================================================
@@ -180,30 +143,48 @@ public class BookingService {
             // passate insieme dal controllo del passo 0. Il vincolo UNIQUE
             // della V2 ne ha fatta passare una; questa e' l'altra.
             //
-            // Chi ha chiamato voleva una prenotazione, e la prenotazione c'e'
-            // — l'ha scritta l'altro thread un istante fa. Rispondergli 409
-            // sarebbe tecnicamente vero e praticamente inutile: si rilegge la
-            // riga vincente e gli si da' quella, che e' esattamente cio' che
-            // avrebbe ricevuto arrivando un millisecondo dopo.
+            // E dal G8 la si perde PRIMA di aver toccato qualsiasi altro
+            // servizio: non c'e' niente da compensare, mentre al G7 i posti
+            // di questo tentativo restavano scalati. E' il guadagno concreto
+            // di aver spostato la INSERT all'inizio.
             // ===============================================================
             Booking vincitrice = repository.findByIdempotencyKey(chiave)
                     // Se non c'e', il vincolo violato era un ALTRO (saga_id):
                     // non e' una corsa, e' un caso che non sappiamo spiegare.
-                    // L'eccezione originale risale e diventa un 409/500 con
-                    // il suo stack trace, invece di un messaggio inventato.
+                    // L'eccezione originale risale e diventa un 409/500.
                     .orElseThrow(() -> e);
 
-            // WARN e non INFO: qui i posti del passo 3 SONO stati scalati due
-            // volte, una per ciascuna delle due richieste in corsa, e nessuno
-            // rimette a posto i nostri. E' lo stesso buco del G6 visto da
-            // un'altra porta, e si chiude al G8 con showsClient.rilascia().
-            log.warn("[saga {}] corsa persa sulla Idempotency-Key {}: vince la "
-                    + "prenotazione {}. ATTENZIONE: i {} posti riservati da questo "
-                    + "tentativo restano scalati (compensazione al G8)",
-                    sagaId, chiave, vincitrice.getId(), quantita);
+            log.info("[saga {}] corsa persa sulla Idempotency-Key {}: vince la prenotazione {}. "
+                    + "Nessun servizio e' stato chiamato, niente da compensare",
+                    sagaId, chiave, vincitrice.getId());
 
             return EsitoPrenotazione.ripetuta(vincitrice);
         }
+
+        // --- 4. la saga ---
+        // Da qui in avanti ogni passo cambia qualcosa in un altro processo, e
+        // ogni passo ha la sua compensazione. Se qualcosa va storto,
+        // BookingSaga rimette a posto e rilancia: il 402 o il 503 arrivano
+        // al chiamante, e il sistema non resta a meta'.
+        return EsitoPrenotazione.creata(saga.esegui(apertura.prenotazione(), apertura.saga()));
+    }
+
+    /**
+     * PASSO 8.2 — QUANTI PUNTI VALE QUESTO ACQUISTO.
+     *
+     * Un punto per euro speso, arrotondato per DIFETTO. La regola sta qui e
+     * non in loyalty-service, ed e' una decisione: i punti dipendono da
+     * quanto si e' speso, e chi sa quanto si e' speso e' chi ha appena
+     * calcolato il totale. loyalty-service somma e sottrae, e non deve
+     * conoscere ne' prezzi ne' listini — il giorno in cui la promozione
+     * diventa "punti doppi il mercoledi'", a cambiare e' questa riga.
+     *
+     * RoundingMode.FLOOR e non HALF_UP: quando si regala qualcosa, si
+     * sceglie esplicitamente da che parte arrotondare invece di lasciarlo
+     * decidere al default. 9.99 euro fanno 9 punti, e nessuno si stupisce.
+     */
+    private static int puntiFedelta(BigDecimal totale) {
+        return totale.setScale(0, RoundingMode.FLOOR).intValue();
     }
 
     /**
@@ -244,7 +225,8 @@ public class BookingService {
      *
      * Nota: per rispondere NON si chiama nessuno. Titolo e orario sono sulla
      * nostra riga (passo 6.3), quindi l'elenco delle prenotazioni si legge
-     * anche con shows-service spento. E' il vantaggio concreto della copia.
+     * anche con tutti gli altri servizi spenti. E' il vantaggio concreto
+     * della copia — e dal G8, con cinque servizi in giro, vale il quintuplo.
      */
     @Transactional(readOnly = true)
     public Page<Booking> elenco(Pageable pageable) {

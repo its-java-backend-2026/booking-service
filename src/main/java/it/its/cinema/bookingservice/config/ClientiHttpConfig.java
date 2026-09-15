@@ -17,10 +17,13 @@ import org.springframework.web.client.RestClient;
  *
  *  1. OGNUNO HA IL SUO INDIRIZZO. Un RestClient con baseUrl fissato evita
  *     che gli URL assoluti si spargano per il codice dei gateway.
- *  2. DAL G7 OGNUNO AVRA' LA SUA POLITICA. Circuit breaker e retry si
+ *  2. DAL G7 OGNUNO HA LA SUA POLITICA. Circuit breaker e retry si
  *     configurano per servizio: pricing e' ritentabile (e' puro), payment
- *     non lo sara' mai. Con un client solo, quella distinzione non si
- *     potrebbe nemmeno esprimere.
+ *     non lo e' e non lo sara' mai (passo 7.3). Con un client solo, quella
+ *     distinzione non si potrebbe nemmeno esprimere.
+ *
+ *  Dal G8 i bean sono QUATTRO: si sono aggiunti payment-service (8085) e
+ *  loyalty-service (8084), i due partecipanti nuovi della saga.
  *
  * ===========================================================================
  * PASSO 6.6 — PERCHE' I TIMEOUT NON SONO "TUNING"
@@ -79,6 +82,34 @@ public class ClientiHttpConfig {
     @Bean
     RestClient pricingRestClient(RestClient.Builder builder,
                                  @Value("${cinema.pricing.url}") String baseUrl) {
+        return builder
+                .baseUrl(baseUrl)
+                .requestFactory(fabbricaConTimeout())
+                .build();
+    }
+
+    /**
+     * PASSO 8.1 — il client verso payment-service.
+     *
+     * Quattro bean invece di due, e la ragione e' quella scritta in cima:
+     * ognuno ha il suo indirizzo e la sua politica. Qui la differenza si
+     * vede finalmente per davvero — payment e' l'unico a non avere @Retry su
+     * nessuna chiamata (passo 7.3), e con un RestClient condiviso quella
+     * distinzione non si potrebbe nemmeno esprimere.
+     */
+    @Bean
+    RestClient paymentRestClient(RestClient.Builder builder,
+                                 @Value("${cinema.payment.url}") String baseUrl) {
+        return builder
+                .baseUrl(baseUrl)
+                .requestFactory(fabbricaConTimeout())
+                .build();
+    }
+
+    /** PASSO 8.2 — il client verso loyalty-service. */
+    @Bean
+    RestClient loyaltyRestClient(RestClient.Builder builder,
+                                 @Value("${cinema.loyalty.url}") String baseUrl) {
         return builder
                 .baseUrl(baseUrl)
                 .requestFactory(fabbricaConTimeout())

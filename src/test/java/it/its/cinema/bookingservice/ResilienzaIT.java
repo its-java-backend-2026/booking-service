@@ -57,6 +57,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
         "cinema.shows.url=http://localhost:1",
         // la porta 1: connessione rifiutata all'istante
         "cinema.pricing.url=http://localhost:1",
+        // PASSO 8.1 e 8.2 — anche i due servizi del G8 puntano nel vuoto:
+        // qui si guardano le politiche di resilienza, non le loro risposte.
+        "cinema.payment.url=http://localhost:1",
+        "cinema.loyalty.url=http://localhost:1",
 
         // Il jitter e il backoff del passo 7.3 sono giusti in esercizio e
         // inutili qui: farebbero durare il test sei secondi per verificare
@@ -64,9 +68,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
         // non il numero di tentativi, che e' cio' che si sta verificando.
         "resilience4j.retry.instances.pricing.waitDuration=1ms",
         "resilience4j.retry.instances.pricing.enableExponentialBackoff=false",
-        "resilience4j.retry.instances.pricing.enableRandomizedWait=false"
+        "resilience4j.retry.instances.pricing.enableRandomizedWait=false",
+        // Dal G8 anche shows ha il suo retry (passo 8.3): stessa ragione.
+        "resilience4j.retry.instances.shows.waitDuration=1ms",
+        "resilience4j.retry.instances.shows.enableExponentialBackoff=false",
+        "resilience4j.retry.instances.shows.enableRandomizedWait=false"
 })
-@DisplayName("Resilienza — il circuit breaker e il retry del G7")
+@DisplayName("Resilienza — il circuit breaker del G7 e i retry del G8")
 class ResilienzaIT {
 
     @Container
@@ -78,6 +86,9 @@ class ResilienzaIT {
 
     @Autowired
     ShowsClient showsClient;
+
+    @Autowired
+    it.its.cinema.bookingservice.client.PaymentClient paymentClient;
 
     @Autowired
     CircuitBreakerRegistry breaker;
@@ -222,30 +233,74 @@ class ResilienzaIT {
 
     /**
      * ===================================================================
-     * PASSO 7.3 — E LA COSA CHE NON C'E', CHE E' LA PIU' IMPORTANTE.
+     * PASSO 8.3 — LA RIGA CHE AL G7 DICEVA L'OPPOSTO.
      *
-     * Non esiste un Retry chiamato "shows" attaccato a riserva(): il retry
-     * su shows sta solo sulla lettura. Ritentare POST /shows/{id}/reserve
-     * dopo un timeout scalerebbe i posti una seconda volta, perche' timeout
-     * non vuol dire "non e' arrivata" ma "non so se e' arrivata".
+     * Fino a ieri questo test si chiamava "riserva() NON viene ritentata" e
+     * verificava che il contatore del retry "shows" restasse fermo:
+     * ritentare POST /shows/{id}/reserve dopo un timeout scalava i posti una
+     * seconda volta, perche' timeout non vuol dire "non e' arrivata" ma "non
+     * so se e' arrivata".
      *
-     * Il test guarda il contatore dei tentativi del retry "shows" mentre si
-     * chiama riserva() su un servizio spento: se qualcuno un giorno
-     * aggiungesse @Retry a quel metodo — sembra un miglioramento, e in un
-     * pomeriggio distratto sembra perfino ovvio — questo test lo fermerebbe.
+     * Dal G8 shows-service registra ogni operazione su (saga_id,
+     * operation_type) con un vincolo UNIQUE: la seconda chiamata identica non
+     * fa niente. Ripetere e' diventato gratis, quindi il retry e' diventato
+     * sicuro — ed e' stato acceso.
+     *
+     * IL TEST E' STATO ROVESCIATO DI PROPOSITO, e vale la pena dirlo: non e'
+     * stato cancellato perche' dava fastidio. La regola ("si ritenta cio' che
+     * e' idempotente") non e' cambiata; e' cambiato il fatto che adesso lo
+     * sia, e il lavoro per renderlo tale e' stato fatto dall'altra parte del
+     * filo. Se un giorno qualcuno togliesse show_operations da shows-service,
+     * questo test continuerebbe a passare e il danno tornerebbe in silenzio:
+     * a proteggere quel lato c'e' IdempotenzaSagaIT, nel suo repository.
      * ===================================================================
      */
     @Test
-    @DisplayName("riserva() NON viene ritentata: ripetere una POST che scala posti e' un danno")
-    void laRiservaNonSiRitenta() {
+    @DisplayName("PASSO 8.3 — riserva() ORA viene ritentata, perche' shows e' idempotente")
+    void laRiservaOraSiRitenta() {
         var metriche = retry.retry("shows").getMetrics();
-        long primaDelTest = metriche.getNumberOfFailedCallsWithRetryAttempt()
-                + metriche.getNumberOfFailedCallsWithoutRetryAttempt();
+        long primaDelTest = metriche.getNumberOfFailedCallsWithRetryAttempt();
 
         assertThatThrownBy(() -> showsClient.riserva(1L, 2, "saga-di-prova"))
                 .isInstanceOf(ServizioNonDisponibileException.class);
 
-        // Il retry di shows non ha visto passare NIENTE: la chiamata non e'
+        // "fallita DOPO aver ritentato": e' il contatore che al G7 doveva
+        // restare fermo, e oggi deve salire.
+        assertThat(metriche.getNumberOfFailedCallsWithRetryAttempt())
+                .isGreaterThan(primaDelTest);
+
+        // E il breaker l'ha vista come UN campione, non come tre: e'
+        // l'ordine degli aspetti del passo 7.2 (breaker fuori, retry
+        // dentro), che il G8 non ha toccato.
+        assertThat(breaker.circuitBreaker("shows").getMetrics().getNumberOfFailedCalls())
+                .isGreaterThan(0);
+    }
+
+    /**
+     * PASSO 7.3 — E LA COSA CHE NON C'E', CHE RESTA LA PIU' IMPORTANTE.
+     *
+     * Su payment non c'e' nessun @Retry, su nessuno dei due metodi, e non
+     * cambiera' al prossimo giro: con i soldi il margine si tiene largo.
+     * Un'autorizzazione di cui non si conosce l'esito si riconcilia
+     * guardando, non ritentando al buio.
+     *
+     * Il test guarda il registro: se qualcuno aggiungesse @Retry(name =
+     * "payment") a PaymentClient — sembra un miglioramento, e in un
+     * pomeriggio distratto sembra perfino ovvio — il contatore si
+     * muoverebbe e questo test lo fermerebbe.
+     */
+    @Test
+    @DisplayName("PASSO 7.3 — il pagamento NON viene mai ritentato")
+    void ilPagamentoNonSiRitentaMai() {
+        var metriche = retry.retry("payment").getMetrics();
+        long primaDelTest = metriche.getNumberOfFailedCallsWithRetryAttempt()
+                + metriche.getNumberOfFailedCallsWithoutRetryAttempt();
+
+        assertThatThrownBy(() -> paymentClient.autorizza("saga-di-prova", 1L,
+                new java.math.BigDecimal("20.00")))
+                .isInstanceOf(ServizioNonDisponibileException.class);
+
+        // Il retry di payment non ha visto passare NIENTE: la chiamata non e'
         // mai entrata nel suo perimetro.
         assertThat(metriche.getNumberOfFailedCallsWithRetryAttempt()
                 + metriche.getNumberOfFailedCallsWithoutRetryAttempt())
@@ -253,7 +308,7 @@ class ResilienzaIT {
 
         // Il breaker invece l'ha vista: rifiutarsi di chiamare non ha
         // effetti collaterali, rieseguire si'.
-        assertThat(breaker.circuitBreaker("shows").getMetrics().getNumberOfFailedCalls())
+        assertThat(breaker.circuitBreaker("payment").getMetrics().getNumberOfFailedCalls())
                 .isGreaterThan(0);
     }
 }

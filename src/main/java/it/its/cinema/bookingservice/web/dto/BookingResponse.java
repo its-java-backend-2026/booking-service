@@ -51,5 +51,16 @@ public record BookingResponse(
         BigDecimal totalPrice,
 
         @Schema(description = "Quando e' stata registrata", example = "2026-09-12T15:04:11")
-        LocalDateTime createdAt) {
+        LocalDateTime createdAt,
+
+        /**
+         * PASSO 8.4 — CONFERMATA, IN_CORSO o FALLITA.
+         *
+         * Esce nella risposta perche' dal G8 non e' piu' scontato: una
+         * prenotazione esiste anche quando l'acquisto non e' andato a buon
+         * fine. Un client che stampasse il biglietto senza guardare questo
+         * campo stamperebbe anche i tentativi falliti.
+         */
+        @Schema(description = "CONFERMATA, IN_CORSO o FALLITA", example = "CONFERMATA")
+        String stato) {
 }

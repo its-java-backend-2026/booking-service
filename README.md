@@ -3,54 +3,122 @@
 Le prenotazioni, e il coordinamento dell'acquisto. Porta **8083**, database
 **`booking_db`** (suo, non uno schema dentro `shows_db`).
 
-È l'unico dei tre servizi che **chiama** gli altri, e questo cambia tutto ciò
-che gli serve addosso: timeout espliciti, traduzione degli errori altrui e,
-dal G7, circuit breaker, retry e idempotenza.
+È l'unico dei cinque servizi che **chiama** gli altri, e questo cambia tutto
+ciò che gli serve addosso: timeout espliciti, traduzione degli errori altrui,
+dal G7 circuit breaker, retry e idempotenza, e dal G8 il ruolo di
+**orchestratore della saga** di acquisto.
 
 ---
 
-## Il flusso di `POST /bookings` (passo 6.10)
+## Il flusso di `POST /bookings` (passi 6.10 e 8.5)
 
 ```
-0. SELECT per Idempotency-Key               se c'è già -> 200, e si finisce qui
-1. GET  shows-service   /shows/{id}        prezzo base, orario, titolo
-2. POST pricing-service /prices/quote      prezzo unitario
-3. POST shows-service   /shows/{id}/reserve   i posti vengono scalati
-4. INSERT su booking_db                     -> 201 Created
+0. SELECT per Idempotency-Key                se c'è già -> 200, e si finisce qui
+1. GET  shows-service   /shows/{id}          prezzo base, orario, titolo
+2. POST pricing-service /prices/quote        prezzo unitario
+3. INSERT booking (IN_CORSO) + saga (AVVIATA)        <- SagaStore, una transazione
+─── da qui comincia la saga, e ogni passo ha la sua compensazione ───
+4. POST shows-service   /shows/{id}/reserve  -> passo POSTI_RISERVATI
+5. POST payment-service /payments/authorize  -> passo PAGATO
+6. POST loyalty-service /loyalty/{id}/credit -> passo PUNTI_ACCREDITATI
+7. UPDATE booking (CONFERMATA) + saga (COMPLETATA)   -> 201 Created
 ```
 
-Il passo 0 è del G7 (7.6) ed è il più economico di tutti: una query, e le tre
-chiamate HTTP non avvengono affatto.
+Il passo 0 è del G7 (7.6) ed è il più economico di tutti: una query, e nessuna
+chiamata HTTP avviene affatto.
 
 **L'ordine è la regola, non un dettaglio.** Riservare prima di conoscere il
 prezzo significherebbe tenere occupati dei posti per un acquisto che potrebbe
 non concludersi. Tutto ciò che può fallire senza conseguenze, fallisce prima.
 
-Il passo 3 è il primo **irreversibile**: da lì in poi qualcosa è cambiato in un
-altro servizio.
+Il passo 4 è il primo **irreversibile**: da lì in poi qualcosa è cambiato in un
+altro servizio, e c'è qualcosa da compensare.
 
-### Il buco del G6, che è in vista di proposito
+### Il buco del G6 si chiude qui
 
-Se il passo 4 fallisce — il database è pieno, la connessione cade, il processo
-viene ucciso in mezzo — **i posti restano riservati**. Il cliente riceve un
-errore e non ha nessuna prenotazione; il cinema ha due poltrone in meno da
-vendere, per sempre, e nessuno lo sa.
+Fino al G7 la riga si scriveva **alla fine**, dopo aver riservato i posti: se
+la `INSERT` falliva, i posti restavano scalati per sempre e nessuno lo sapeva.
+Il commento in cima a `BookingService` lo dichiarava da due giornate.
 
-Non si risolve con una transazione più grande: una transazione locale non può
-annullare un POST HTTP già arrivato a destinazione. Il rollback distribuito
-esiste (XA, two-phase commit) e nei microservizi non si usa, perché tiene
-bloccate le risorse di tutti i partecipanti per tutta la durata
-dell'operazione.
+Dal G8 la riga si scrive **prima** (passo 3), e cambia due cose:
 
-La soluzione è la **saga**, ed è il G8. `ShowsClient.rilascia()` è già scritto
-e oggi non lo chiama nessuno. C'è perfino un test che lo afferma:
+1. da quando i posti vengono scalati esiste già una riga che dice che qualcuno
+   li ha presi e una saga che sa come rimetterli a posto;
+2. la corsa sull'`Idempotency-Key` si risolve **prima** di aver chiamato
+   chiunque: due doppi clic simultanei non arrivano nemmeno a riservare.
+
+Non è un dettaglio di ordine: scrivere il fatto **prima** di agire fuori è
+l'unico modo di sapere, dopo, che cosa si era cominciato.
+
+---
+
+## La saga (G8)
+
+`BookingSaga` è venti righe e si legge come una lista della spesa. È il punto
+dell'orchestrazione: il flusso di un acquisto sta scritto **in un posto solo**.
 
 ```java
-@DisplayName("G6, il buco noto: se il salvataggio fallisce i posti restano riservati")
+try {
+    shows.riserva(...);    store.avanza(saga, POSTI_RISERVATI);
+    payment.autorizza(...); store.avanza(saga, PAGATO);
+    loyalty.accredita(...); store.avanza(saga, PUNTI_ACCREDITATI);
+    return store.conferma(prenotazione, saga);
+} catch (RuntimeException e) {
+    compensa(sagaId, saga, e);
+    store.fallisci(prenotazione);
+    throw e;                       // il 402 o il 503 arrivano al chiamante
+}
 ```
 
-Al G8 quella riga diventerà `verify(showsClient).rilascia(...)` e il test
-racconterà la storia del cambiamento.
+Ogni passo è **prima la chiamata, poi la scrittura dello stato**: se il
+processo muore in mezzo, lo stato dice *meno* di quello che è successo. Nel
+dubbio si compensa un passo in meno — un guaio che si vede (posti bloccati) —
+invece che uno di troppo, che sarebbe un rimborso mai dovuto.
+
+### La compensazione (passo 8.7)
+
+Tre regole, e sono tutte e tre visibili nel codice:
+
+1. **guarda lo stato raggiunto, non l'eccezione.** Non c'è nessun `if` sul tipo
+   di errore: l'eccezione dice cosa è andato storto, solo il passo raggiunto
+   dice cosa era già stato fatto.
+2. **va all'indietro** — punti, pagamento, posti. I posti si rilasciano per
+   ultimi perché sono la risorsa più contesa: rilasciarli prima significherebbe
+   darli via mentre si sta ancora stornando un pagamento che potrebbe fallire.
+3. **una compensazione che fallisce non ferma le altre.** Fermarsi alla prima
+   lascerebbe i posti bloccati per sempre: il guasto peggiore, causato dal
+   tentativo di sistemare quello migliore.
+
+### `saga_state` (passo 8.4)
+
+Lo stato della saga sta su una riga, non in una variabile locale. Una variabile
+funziona per tutta la durata della chiamata e smette di funzionare nell'unico
+momento in cui servirebbe: quando il processo muore fra un passo e l'altro.
+
+```sql
+-- la query per cui esiste la tabella
+SELECT * FROM saga_state
+ WHERE stato = 'IN_CORSO' AND aggiornata_il < now() - interval '5 minutes';
+
+-- e quelle che nessun automatismo sistemerà
+SELECT * FROM saga_state WHERE stato = 'COMPENSAZIONE_PARZIALE';
+```
+
+`COMPENSAZIONE_PARZIALE` è lo stato che distingue un sistema distribuito
+raccontato da uno costruito: una compensazione può **fallire** (loyalty non
+risponde) o **riuscire solo in parte** (il cliente ha già speso i punti, passo
+8.2). In entrambi i casi il sistema non è tornato com'era, e c'è una riga che
+lo dice invece di far finta di niente.
+
+### Le scritture stanno in una classe a parte (passo 8.6)
+
+`SagaStore` esiste per due regole che, se violate, **non danno nessun errore**:
+
+- `@Transactional` funziona solo attraverso il proxy di Spring: un metodo
+  privato dell'orchestratore non aprirebbe nessuna transazione, in silenzio;
+- una transazione non deve mai restare aperta durante una chiamata di rete —
+  con i timeout del passo 6.6 e cinque servizi sarebbero fino a quindici
+  secondi di connessione occupata per prenotazione.
 
 ---
 
@@ -134,19 +202,29 @@ campione, ritentata o no, e a circuito aperto si risponde in microsecondi.
 
 ```
 perId()      GET, una lettura                 @CircuitBreaker + @Retry
-riserva()    POST che SCALA dei posti         @CircuitBreaker, e basta
-rilascia()   POST che RIMETTE dei posti       @CircuitBreaker, e basta
+riserva()    POST che SCALA dei posti         @CircuitBreaker + @Retry  (dal G8)
+rilascia()   POST che RIMETTE dei posti       @CircuitBreaker + @Retry  (dal G8)
 quote()      calcolo puro                     @CircuitBreaker + @Retry
+accredita()  POST idempotente sul sagaId      @CircuitBreaker + @Retry  (G8)
+storna()     POST idempotente sul sagaId      @CircuitBreaker + @Retry  (G8)
+autorizza()  il pagamento                     @CircuitBreaker, e basta
+refund()     lo storno del pagamento          @CircuitBreaker, e basta
 ```
 
 La regola è l'**idempotenza**, non «è una GET». E il caso in cui il retry
 scatta è proprio quello in cui il danno è più probabile: il **timeout**.
-Timeout non vuol dire «non è arrivata», vuol dire «non so se è arrivata» — il
-più delle volte i posti sono già stati scalati e l'altro sta solo rispondendo
-piano. Ritentare lì significa vendere due volte le stesse poltrone.
+Timeout non vuol dire «non è arrivata», vuol dire «non so se è arrivata».
 
-Si accenderà al G8, quando `shows-service` riconoscerà il `sagaId` già visto.
-Il `sagaId` viaggia già oggi: è metà del lavoro, fatta in anticipo.
+**Al G8 il retry su `riserva()` si è acceso**, come era scritto qui dal G7:
+`shows-service` ha la sua `show_operations` con `UNIQUE (saga_id,
+operation_type)`, quindi la seconda chiamata non fa niente. La regola non è
+cambiata — si ritenta ciò che è idempotente — è cambiato il fatto che adesso lo
+sia, e il lavoro per renderlo tale è stato fatto **dall'altra parte del filo**.
+
+**Su `payment` non c'è retry, e non ci sarà** (passo 7.3). Tecnicamente sarebbe
+sicuro (`UNIQUE` su `saga_id`), ma con i soldi il margine si tiene largo:
+un'autorizzazione di cui non si conosce l'esito si riconcilia guardando, non
+ritentando al buio. C'è un test che lo verifica.
 
 Il **breaker** invece sta su tutti: non riesegue niente, si limita a non
 tentare, e rifiutarsi di chiamare non ha mai effetti collaterali.
@@ -250,23 +328,32 @@ richiesta ha creato qualcosa, e ripetendola non è vero.
 E non è un errore: un 409 insegnerebbe ai client a non ritentare mai, che è il
 contrario di ciò per cui l'idempotenza esiste.
 
-### Il buco che resta
+### Il buco che c'era, e che dal G8 non c'è più
 
-Due richieste in corsa riservano i posti **tutte e due** prima che il vincolo
-ne fermi una. I posti del tentativo perdente restano scalati — è lo stesso
-buco del G6 visto da un'altra porta, il log lo dice a `WARN`, e si chiude al
-G8 con `showsClient.rilascia()`.
+Fino al G7 due richieste in corsa riservavano i posti **tutte e due** prima che
+il vincolo ne fermasse una, e i posti del tentativo perdente restavano scalati.
+Dal G8 la corsa si perde **prima** di chiamare chiunque, perché la `INSERT` è
+il passo 3 e non il 7: non c'è niente da compensare perché non c'è niente da
+disfare.
 
 ---
 
 ## La traduzione degli errori (passo 6.9)
 
-| shows / pricing rispondono | diventa | perché |
+| i servizi a valle rispondono | diventa | perché |
 |---|---|---|
-| `404` | **404** | l'utente ha chiesto uno spettacolo che non c'è: errore suo, non guasto nostro |
-| `409` | **409** | la richiesta era scritta bene, è lo *stato* a renderla impossibile |
+| `404` di shows | **404** | l'utente ha chiesto uno spettacolo che non c'è: errore suo, non guasto nostro |
+| `409` di shows | **409** | la richiesta era scritta bene, è lo *stato* a renderla impossibile |
+| `402` di payment | **402** | il pagamento ha funzionato, e la risposta è no. **La saga ha già compensato** |
 | `5xx` o timeout | **503** + `Retry-After` | il nostro codice ha funzionato, è un altro a non esserci |
 | altri `4xx` | **500** | **siamo noi** ad aver mandato una richiesta sbagliata |
+
+Il `402` è l'esito nuovo del G8, e porta nel corpo un'informazione che al G7
+non avremmo potuto dare: `"compensata": true`. È la sola cosa che distingue
+*«non hai comprato»* da *«non hai comprato e ho lasciato due poltrone
+bloccate»*. Non conta come fallimento per il circuit breaker (`ignoreExceptions`
+in `application.yaml`): dieci carte rifiutate non sono un guasto, e contarle
+toglierebbe la possibilità di pagare a tutti gli altri.
 
 L'ultima riga è la più istruttiva. Un 400 da un servizio a valle significa che
 il nostro JSON non gli piace: contratto disallineato, campo mancante, tipo
@@ -402,7 +489,7 @@ for i in $(seq 1 12); do
        -X POST localhost:8083/bookings \
        -H "Content-Type: application/json" \
        -H "Idempotency-Key: $(uuidgen)" \
-       -d '{"showId":1,"customerType":"STUDENT","quantity":2}'
+       -d '{"showId":1,"customerId":"mario.rossi","customerType":"STUDENT","quantity":2}'
 done
 ```
 
@@ -423,6 +510,45 @@ curl -s localhost:8083/bookings/1            # continua a funzionare: 200 istant
 docker compose start pricing-service         # e riparte da solo, senza riavviare niente
 ```
 
+### Provare il fallimento della saga (passo 8.8)
+
+Il fallimento si provoca a comando: `payment-service` rifiuta sopra la soglia,
+e 20 posti da 10.00 euro fanno 200.00.
+
+```bash
+cd ../cinema-deploy && docker compose up -d
+
+# PRIMA: quanti posti ha lo spettacolo 1
+curl -s localhost:8081/shows/1 | jq .availableSeats
+
+curl -i -X POST localhost:8083/bookings \
+     -H "Content-Type: application/json" \
+     -H "Idempotency-Key: $(uuidgen)" \
+     -d '{"showId":1,"customerId":"mario.rossi","customerType":"STUDENT","quantity":20}'
+# -> 402 Payment Required, "compensata": true
+
+# DOPO: gli stessi posti di prima. È la consegna del G8.
+curl -s localhost:8081/shows/1 | jq .availableSeats
+```
+
+E la saga racconta dove si è fermata:
+
+```bash
+docker exec -it booking-db psql -U cinema -d booking_db \
+  -c "SELECT id, booking_id, passo_raggiunto, stato, ultimo_errore
+        FROM saga_state ORDER BY id DESC LIMIT 5;"
+```
+
+```
+ passo_raggiunto  |   stato    |              ultimo_errore
+-----------------+------------+------------------------------------------
+ POSTI_RISERVATI | COMPENSATA | ...Pagamento rifiutato: Importo 200.00...
+```
+
+`POSTI_RISERVATI` e non `PAGATO`: la saga si è fermata **prima** del pagamento,
+quindi la compensazione ha rilasciato i posti e non ha stornato niente
+— non c'era niente da stornare.
+
 ---
 
 ## I test
@@ -434,10 +560,18 @@ docker compose start pricing-service         # e riparte da solo, senza riavviar
 
 | File | Domanda a cui risponde |
 |---|---|
-| `BookingServiceTest` | la **coreografia**: quali passi, in quale ordine, cosa succede quando uno fallisce — e l'idempotenza del 7.6, corsa persa compresa. Gateway mockati, niente rete |
-| `BookingControllerTest` | la **tabella di traduzione** del passo 6.9 e il contratto dell'`Idempotency-Key`, visti in HTTP |
+| `BookingServiceTest` | l'idempotenza del 7.6 (corsa persa compresa) e l'apertura della saga: chi viene chiamato *prima* che la saga cominci |
+| `BookingSagaTest` | le **decisioni** del G8: quali compensazioni, in quale ordine, e cosa succede quando una compensazione fallisce o riesce a metà. Client mockati, niente rete |
+| `BookingControllerTest` | la **tabella di traduzione** del 6.9, il `402` del G8 e il contratto dell'`Idempotency-Key`, visti in HTTP |
 | `BookingRepositoryIT` | la `V1`, la `V2` e l'entità dicono la stessa cosa |
-| `ResilienzaIT` | il G7 è **acceso davvero**: il circuito si apre, il retry ritenta, e `riserva()` non viene ritentata |
+| `SagaIT` | cosa **resta scritto** su `booking_db` quando è finita: `CONFERMATA`/`FALLITA`, `COMPLETATA`/`COMPENSATA`/`COMPENSAZIONE_PARZIALE`, e il passo a cui ci si è fermati |
+| `ResilienzaIT` | il G7 è **acceso davvero**, e dal G8 che `riserva()` *viene* ritentata mentre il pagamento no |
+
+`BookingSagaTest` e `SagaIT` si dividono il lavoro come si dividono il codice:
+il primo prova le decisioni, il secondo cosa arriva sul database. Il secondo ha
+bisogno di un container per una ragione precisa: una `@Transactional` che non
+si apre — perché qualcuno ha spostato i metodi di `SagaStore` dentro
+l'orchestratore — non dà nessun errore, e con i mock non si vedrebbe.
 
 `ResilienzaIT` verifica il *cablaggio*, non Resilience4j. Tre cose che non
 falliscono in compilazione: senza `resilience4j-spring-boot3` le annotazioni

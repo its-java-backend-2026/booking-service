@@ -1,7 +1,8 @@
 ### booking-service — porta 8083
 ###
-### E' il servizio che CHIAMA gli altri due. Perche' queste richieste
-### funzionino servono shows-service (8081) e pricing-service (8082) accesi:
+### E' il servizio che CHIAMA gli altri quattro. Perche' queste richieste
+### funzionino servono shows-service (8081), pricing-service (8082),
+### loyalty-service (8084) e payment-service (8085) accesi:
 ###     cd ../cinema-deploy && docker compose up --build
 ###
 ### CONSEGNA G6: la POST qui sotto crea la prenotazione con il prezzo
@@ -10,8 +11,15 @@
 ### CONSEGNA G7: con pricing spento il sistema degrada con grazia invece di
 ### cadere, e lo stato del breaker si legge da Actuator. Le prove stanno in
 ### fondo al file.
+###
+### CONSEGNA G8: un pagamento rifiutato non lascia mai posti bloccati. La
+### prova e' la sezione "LA SAGA DEL G8", in fondo.
 
 @host = http://localhost:8083
+
+### PASSO 8.2 — chi sta comprando. Dal G8 serve: i punti fedelta' vanno
+### accreditati a qualcuno, e stornati a qualcuno quando la saga compensa.
+@cliente = mario.rossi
 
 ### PASSO 7.6 — le chiavi di idempotenza.
 ###
@@ -57,6 +65,7 @@ Idempotency-Key: {{chiave}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STUDENT",
   "quantity": 2
 }
@@ -69,6 +78,7 @@ Idempotency-Key: {{chiave2}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STANDARD",
   "quantity": 1
 }
@@ -103,6 +113,7 @@ Idempotency-Key: {{chiave3}}
 
 {
   "showId": 99999,
+  "customerId": "{{cliente}}",
   "customerType": "STUDENT",
   "quantity": 2
 }
@@ -118,6 +129,7 @@ Idempotency-Key: {{chiave4}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STANDARD",
   "quantity": 20
 }
@@ -139,6 +151,7 @@ Idempotency-Key: {{chiave8}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STUDENT",
   "quantity": 2
 }
@@ -157,6 +170,7 @@ Idempotency-Key: {{chiave5}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STUDENT",
   "quantity": 500
 }
@@ -169,6 +183,7 @@ Idempotency-Key: {{chiave6}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "VIP",
   "quantity": 2
 }
@@ -184,6 +199,7 @@ Idempotency-Key: {{chiave7}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STUDENT",
   "quantity": 1,
   "unitPrice": 0.01
@@ -217,6 +233,7 @@ Idempotency-Key: {{chiave}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STUDENT",
   "quantity": 2
 }
@@ -232,6 +249,7 @@ Content-Type: application/json
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STUDENT",
   "quantity": 2
 }
@@ -291,6 +309,7 @@ Idempotency-Key: {{chiave9}}
 
 {
   "showId": 1,
+  "customerId": "{{cliente}}",
   "customerType": "STUDENT",
   "quantity": 2
 }
@@ -346,3 +365,123 @@ GET {{host}}/actuator/health/liveness
 
 ### La documentazione delle API
 GET {{host}}/swagger-ui.html
+
+
+### =====================================================================
+###  LA SAGA DEL G8  —  passo 8.8
+###
+###  Il fallimento si provoca a comando: payment-service rifiuta sopra la
+###  soglia (default 100.00), e 20 posti da 10.00 euro fanno 200.00.
+###
+###  DA GUARDARE PRIMA E DOPO, ed e' tutto il senso della giornata:
+###  la disponibilita' dello spettacolo 1 deve essere la STESSA.
+### =====================================================================
+
+### 1. PRIMA — quanti posti ci sono
+GET http://localhost:8081/shows/1
+
+### 2. Il saldo punti del cliente, prima di tutto
+GET http://localhost:8084/loyalty/{{cliente}}
+
+### 3. LA PRENOTAZIONE CHE FALLISCE — 20 posti = 200.00, oltre la soglia
+###
+### Cosa succede, in quest'ordine:
+###   1. shows      riserva 20 posti          -> fatto
+###   2. payment    autorizza 200.00          -> 402, RIFIUTATO
+###   3. la saga compensa ALL'INDIETRO:
+###        - i punti? mai accreditati, non si storna niente
+###        - il pagamento? mai autorizzato, non si storna niente
+###        - i posti? SI', e tornano disponibili
+###
+### Risposta: 402 Payment Required, con "compensata": true nel corpo.
+POST {{host}}/bookings
+Content-Type: application/json
+Idempotency-Key: saga-fallita-{{$timestamp}}
+
+{
+  "showId": 1,
+  "customerId": "{{cliente}}",
+  "customerType": "STUDENT",
+  "quantity": 20
+}
+
+### 4. DOPO — i posti sono TORNATI: e' la consegna del G8
+GET http://localhost:8081/shows/1
+
+### 5. E il saldo punti non e' cambiato: quel passo non era stato raggiunto
+GET http://localhost:8084/loyalty/{{cliente}}
+
+### 6. La prenotazione esiste ancora, e dice com'e' andata: "stato": "FALLITA"
+### (l'id lo si legge nei log di booking-service, o dall'elenco qui sotto)
+GET {{host}}/bookings?size=5
+
+### 7. LA PRENOTAZIONE CHE RIESCE — 2 posti = 20.00, sotto la soglia
+### Alla fine: posti scalati, pagamento autorizzato, 20 punti accreditati.
+POST {{host}}/bookings
+Content-Type: application/json
+Idempotency-Key: saga-riuscita-{{$timestamp}}
+
+{
+  "showId": 1,
+  "customerId": "{{cliente}}",
+  "customerType": "STUDENT",
+  "quantity": 2
+}
+
+### 8. Il saldo punti e' salito di 20 (2 posti x 10.00)
+GET http://localhost:8084/loyalty/{{cliente}}
+
+### 9. Il pagamento di quella saga
+### (sostituire il sagaId con quello letto nella risposta al punto 7)
+GET http://localhost:8085/payments/METTERE-QUI-IL-SAGA-ID
+
+### =====================================================================
+###  LE PROVE CHE SI FANNO CON psql  —  passo 8.4
+###
+###  Lo stato delle saghe non ha una rotta HTTP, ed e' voluto: e' un dato
+###  interno, non un'API. Si guarda dal database.
+###
+###    docker exec -it booking-db psql -U cinema -d booking_db
+###
+###    -- le ultime saghe, e com'e' finita ognuna
+###    SELECT id, booking_id, passo_raggiunto, stato, ultimo_errore
+###      FROM saga_state ORDER BY id DESC LIMIT 10;
+###
+###    -- LA QUERY PER CUI ESISTE LA TABELLA: le saghe rimaste per strada
+###    SELECT * FROM saga_state
+###     WHERE stato = 'IN_CORSO' AND aggiornata_il < now() - interval '5 minutes';
+###
+###    -- e quelle che nessun automatismo sistemera'
+###    SELECT * FROM saga_state WHERE stato = 'COMPENSAZIONE_PARZIALE';
+### =====================================================================
+
+### =====================================================================
+###  L'IDEMPOTENZA DEI PARTECIPANTI  —  passo 8.3
+###
+###  Da provare a mano su shows-service: la stessa riserva, due volte, con
+###  lo stesso sagaId. I posti si scalano UNA volta sola.
+### =====================================================================
+
+### a. Riserva 2 posti con un sagaId scelto da noi
+POST http://localhost:8081/shows/1/reserve
+Content-Type: application/json
+
+{ "sagaId": "prova-idempotenza-1", "quantity": 2 }
+
+### b. LA STESSA, ripetuta: availableSeats non cambia (fino al G7 cambiava)
+POST http://localhost:8081/shows/1/reserve
+Content-Type: application/json
+
+{ "sagaId": "prova-idempotenza-1", "quantity": 2 }
+
+### c. Il rilascio, due volte: i posti tornano UNA volta sola
+POST http://localhost:8081/shows/1/release
+Content-Type: application/json
+
+{ "sagaId": "prova-idempotenza-1", "quantity": 2 }
+
+### d. Ripetuto
+POST http://localhost:8081/shows/1/release
+Content-Type: application/json
+
+{ "sagaId": "prova-idempotenza-1", "quantity": 2 }

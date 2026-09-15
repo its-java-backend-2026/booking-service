@@ -1,6 +1,7 @@
 package it.its.cinema.bookingservice.web;
 
 import it.its.cinema.bookingservice.domain.BookingNotFoundException;
+import it.its.cinema.bookingservice.domain.PagamentoRifiutatoException;
 import it.its.cinema.bookingservice.domain.PostiEsauritiException;
 import it.its.cinema.bookingservice.domain.ServizioNonDisponibileException;
 import it.its.cinema.bookingservice.domain.SpettacoloNonTrovatoException;
@@ -103,6 +104,44 @@ public class GestoreErrori extends ResponseEntityExceptionHandler {
         return problema(HttpStatus.CONFLICT, "Operazione gia' registrata",
                 "operazione-gia-registrata",
                 "Questa operazione risulta gia' registrata.");
+    }
+
+    // ---------------------------------------------------------------- 402
+
+    /**
+     * PASSO 8.1 — IL RIFIUTO DEL PAGAMENTO ARRIVA FINO AL CLIENT, COM'E'.
+     *
+     * 402 e non 500, e non 503. La distinzione e' la stessa del passo 6.9
+     * vista da un'altra porta:
+     *
+     *   500  direbbe "ci siamo rotti": non e' vero, ha funzionato tutto.
+     *   503  direbbe "riprova fra poco": non servirebbe a niente, la
+     *        risposta fra poco sara' la stessa. E inviterebbe il client a
+     *        martellare un servizio che sta benissimo.
+     *   402  dice cosa e' successo davvero, e che a cambiare dev'essere
+     *        qualcosa dalla parte di chi paga.
+     *
+     * E PORTA UN'INFORMAZIONE CHE AL G7 NON AVREMMO POTUTO DARE: quando
+     * questo 402 esce, la saga ha gia' compensato. I posti sono tornati
+     * disponibili, il pagamento non risulta, i punti non sono stati dati.
+     * Dirlo nel corpo non e' cortesia — e' la sola cosa che distingue "non
+     * hai comprato" da "non hai comprato e ho lasciato due poltrone
+     * bloccate".
+     *
+     * Il log e' INFO: un pagamento rifiutato non e' un'anomalia da
+     * risolvere, e' una delle risposte previste. Segnarlo come WARN
+     * insegnerebbe a chi guarda i log a ignorare quelli veri.
+     */
+    @ExceptionHandler(PagamentoRifiutatoException.class)
+    public ProblemDetail pagamentoRifiutato(PagamentoRifiutatoException e) {
+        log.info("[saga {}] pagamento rifiutato, la saga ha compensato: {}",
+                e.getSagaId(), e.getMessage());
+
+        ProblemDetail corpo = problema(HttpStatus.PAYMENT_REQUIRED, "Pagamento rifiutato",
+                "pagamento-rifiutato", e.getMessage());
+        corpo.setProperty("sagaId", e.getSagaId());
+        corpo.setProperty("compensata", true);
+        return corpo;
     }
 
     // ---------------------------------------------------------------- 503
