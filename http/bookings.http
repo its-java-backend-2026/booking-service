@@ -173,7 +173,7 @@ GET {{host}}/bookings/abc
 ### toglierebbe dal bilanciatore anche le nostre istanze sane e farebbe
 ### smettere di rispondere pure GET /bookings, che non chiama nessuno.
 GET {{host}}/actuator/health/readiness
-
+### liveness
 GET {{host}}/actuator/health/liveness
 
 ### La documentazione delle API
