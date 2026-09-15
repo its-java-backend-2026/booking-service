@@ -23,4 +23,16 @@ public interface BookingRepository extends JpaRepository<Booking, Long> {
      * rende sensata e' gia' nella V1.
      */
     Optional<Booking> findBySagaId(String sagaId);
+
+    /**
+     * PASSO 7.6 — la domanda "questa richiesta l'ho gia' vista?".
+     *
+     * E' il controllo APPLICATIVO dell'idempotenza, e da solo non basta: due
+     * richieste con la stessa chiave che arrivano insieme rispondono
+     * entrambe "no" e proseguono entrambe. Serve lo stesso, ed e' il caso
+     * normale: risparmia tre chiamate HTTP a ogni doppio clic. A decidere
+     * davvero, nel millisecondo in cui si scrive, e' il vincolo UNIQUE della
+     * V2 — e il service lo tratta come una risposta, non come un errore.
+     */
+    Optional<Booking> findByIdempotencyKey(String idempotencyKey);
 }

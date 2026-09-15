@@ -17,7 +17,36 @@
 	<properties>
 		<java.version>21</java.version>
 		<springdoc.version>3.1.0</springdoc.version>
+		<!-- PASSO 7.1 — il release train di Spring Cloud.
+		     NON si sceglie a caso: ogni release train e' compilato contro una
+		     riga precisa di Spring Boot, e accoppiarne due che non si parlano
+		     produce NoSuchMethodError all'avvio invece di un errore di
+		     compilazione. E' la trappola piu' costosa dell'aggiungere Spring
+		     Cloud a un progetto: la versione la detta Boot, non noi. -->
+		<spring-cloud.version>2025.1.3</spring-cloud.version>
 	</properties>
+
+	<!--
+	  PASSO 7.1 — IL BOM DI SPRING CLOUD.
+
+	  Importato con scope=import e type=pom: non aggiunge NIENTE al progetto,
+	  decide soltanto CHE VERSIONE avranno gli artefatti di Spring Cloud che
+	  dichiariamo sotto. E' il motivo per cui le due dipendenze del passo 7.1
+	  non hanno un <version>: se ce l'avessero, prima o poi una resterebbe
+	  indietro rispetto all'altra e il disallineamento si scoprirebbe in
+	  esercizio.
+	-->
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>org.springframework.cloud</groupId>
+				<artifactId>spring-cloud-dependencies</artifactId>
+				<version>${spring-cloud.version}</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
 
 	<dependencies>
 		<dependency>
@@ -62,6 +91,38 @@
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+
+		<!--
+		  ========================================================================
+		  PASSO 7.1 — LA RESILIENZA, E PERCHE' STA SOLO QUI.
+
+		  booking-service e' l'unico dei tre che CHIAMA gli altri: e' l'unico che
+		  puo' subire il guasto di qualcun altro. shows-service e pricing-service
+		  non chiamano nessuno, e un circuit breaker li' non avrebbe niente da
+		  sorvegliare.
+
+		  Due artefatti e non uno, perche' fanno due cose diverse:
+
+		    spring-cloud-starter-circuitbreaker-resilience4j
+		        l'astrazione di Spring Cloud piu' l'auto-configurazione che
+		        legge il blocco "resilience4j:" di application.yaml e registra
+		        i breaker in Actuator.
+
+		    resilience4j-spring-boot3
+		        gli ASPETTI, cioe' cio' che fa funzionare le annotazioni
+		        @CircuitBreaker e @Retry del passo 7.4. Senza, le annotazioni
+		        si scrivono, compilano, e non fanno assolutamente niente: il
+		        guasto piu' silenzioso di tutta la giornata.
+		  ========================================================================
+		-->
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-circuitbreaker-resilience4j</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.github.resilience4j</groupId>
+			<artifactId>resilience4j-spring-boot3</artifactId>
 		</dependency>
 
 		<!-- PASSO 6.2 — booking-service ha IL SUO database, booking_db.

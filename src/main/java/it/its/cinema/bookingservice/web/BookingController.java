@@ -8,8 +8,8 @@ import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
-import it.its.cinema.bookingservice.domain.Booking;
 import it.its.cinema.bookingservice.service.BookingService;
+import it.its.cinema.bookingservice.service.EsitoPrenotazione;
 import it.its.cinema.bookingservice.web.dto.BookingResponse;
 import it.its.cinema.bookingservice.web.dto.CreateBookingRequest;
 import it.its.cinema.bookingservice.web.mapper.BookingMapper;
@@ -25,6 +25,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -39,6 +40,11 @@ import org.springframework.web.bind.annotation.RestController;
  * Tutta la differenza fra "un servizio" e "tre servizi" sta nel service e nei
  * due gateway. E' quello che permettera' al G8 di cambiare l'orchestrazione
  * senza toccare questa classe.
+ *
+ * Dal G7 una cosa qui cambia davvero, ed e' il passo 7.6: la POST pretende un
+ * header Idempotency-Key. E' l'unico pezzo di resilienza che si vede dal
+ * confine HTTP — circuit breaker e retry stanno tutti nei gateway, e nessuno
+ * di loro ha una riga in questa classe.
  */
 @RestController
 @RequestMapping("/bookings")
@@ -62,12 +68,19 @@ public class BookingController {
     @Operation(summary = "Prenota dei posti",
             description = "Legge lo spettacolo da shows-service, chiede il prezzo a "
                     + "pricing-service, riserva i posti e registra la prenotazione. "
-                    + "Il prezzo NON si accetta dal client: si chiede sempre.")
+                    + "Il prezzo NON si accetta dal client: si chiede sempre. "
+                    + "Richiede l'header Idempotency-Key: ripetere la stessa chiave "
+                    + "restituisce la prenotazione di allora invece di crearne un'altra.")
     @ApiResponses({
             @ApiResponse(responseCode = "201", description = "Prenotazione creata, con header Location",
                     content = @Content(mediaType = "application/json",
                             schema = @Schema(implementation = BookingResponse.class))),
-            @ApiResponse(responseCode = "400", description = "Dati non validi",
+            @ApiResponse(responseCode = "200",
+                    description = "Idempotency-Key gia' vista: la prenotazione di allora, invariata",
+                    content = @Content(mediaType = "application/json",
+                            schema = @Schema(implementation = BookingResponse.class))),
+            @ApiResponse(responseCode = "400",
+                    description = "Dati non validi, o header Idempotency-Key mancante",
                     content = @Content(mediaType = "application/problem+json",
                             schema = @Schema(implementation = ProblemDetail.class))),
             @ApiResponse(responseCode = "404", description = "Lo spettacolo non esiste",
@@ -83,17 +96,42 @@ public class BookingController {
     })
     @PostMapping
     public ResponseEntity<BookingResponse> prenota(
+            @Parameter(description = "Chiave scelta dal CLIENT, una per intenzione di acquisto "
+                    + "(un UUID va benissimo). Ripetere la stessa chiave non crea una "
+                    + "seconda prenotazione.",
+                    required = true, example = "8f14e45f-ceea-467a-9c7e-8a0b1f2d3c4e")
+            @RequestHeader("Idempotency-Key") String chiaveIdempotenza,
+
             @Valid @RequestBody CreateBookingRequest richiesta) {
 
-        Booking creata = service.crea(
+        EsitoPrenotazione esito = service.crea(
+                chiaveIdempotenza,
                 richiesta.showId(),
                 richiesta.customerType(),
                 richiesta.quantity());
 
-        // 201 con Location: il client sa dove e' finita la risorsa che ha
-        // creato, senza doverla cercare. E' meta' del significato di "created".
-        return ResponseEntity.created(URI.create("/bookings/" + creata.getId()))
-                .body(mapper.toResponse(creata));
+        // Location in tutti e due i casi: il client sa dove e' finita la
+        // risorsa senza doverla cercare. E' meta' del significato di "created".
+        URI dove = URI.create("/bookings/" + esito.prenotazione().getId());
+        BookingResponse corpo = mapper.toResponse(esito.prenotazione());
+
+        // ===================================================================
+        // PASSO 7.6 — 200 E NON 201 QUANDO LA CHIAVE ERA GIA' VISTA.
+        //
+        // Il corpo e' identico, e potrebbe sembrare un dettaglio da niente.
+        // Non lo e': "201 Created" e' un'affermazione, dice che QUESTA
+        // richiesta ha creato qualcosa. Ripetendola non e' vero, e un client
+        // che conta le creazioni conterebbe male.
+        //
+        // E soprattutto: 200 non e' un errore. La tentazione e' rispondere
+        // 409 ("esiste gia'") e sarebbe il modo piu' efficace di rendere
+        // inutile tutto il lavoro — un client che riceve un errore quando
+        // ritenta smette di ritentare, ed e' esattamente cio' che
+        // l'idempotenza esiste per permettergli di fare in sicurezza.
+        // ===================================================================
+        return esito.giaEsistente()
+                ? ResponseEntity.ok().location(dove).body(corpo)
+                : ResponseEntity.created(dove).body(corpo);
     }
 
     @Operation(summary = "Cerca una prenotazione per ID",

@@ -31,6 +31,16 @@ spring:
     enabled: true
     locations: classpath:db/migration
 
+  # Spring Cloud arriva insieme al circuit breaker del passo 7.1 e si porta
+  # dietro un indicatore di service discovery che noi non usiamo: comparirebbe
+  # in /actuator/health come UNKNOWN, senza fare danni e confondendo chi legge.
+  # Si spegne — non c'e' nessun registry, e dirlo e' meglio che lasciarlo dire.
+  cloud:
+    discovery:
+      client:
+        composite-indicator:
+          enabled: false
+
 # ===========================================================================
 # PASSO 6.6 — DOVE ABITANO I SERVIZI A VALLE.
 #
@@ -49,6 +59,187 @@ cinema:
   pricing:
     url: ${CINEMA_PRICING_URL:http://localhost:8082}
 
+
+# ===========================================================================
+# PASSI 7.2 e 7.3 — IL CIRCUIT BREAKER E IL RETRY.
+#
+# Sono due rimedi a due mali diversi, e confonderli e' l'errore piu' comune:
+#
+#   RETRY            "e' stato un intoppo, riprovo io per te"
+#                    Serve contro il guasto PASSEGGERO: un pacchetto perso,
+#                    un riavvio, una latenza momentanea.
+#
+#   CIRCUIT BREAKER  "e' rotto, smetto di chiamarlo"
+#                    Serve contro il guasto PERSISTENTE. Continuare a
+#                    chiamare un servizio in ginocchio gli impedisce di
+#                    rialzarsi, e intanto occupa i NOSTRI thread nell'attesa.
+#
+# Messi insieme si completano; messi male si sommano: senza breaker, il retry
+# TRIPLICA il carico su un servizio che sta gia' affogando.
+#
+# ===========================================================================
+# E IN CHE ORDINE SI ANNIDANO, CHE E' LA RIGA CHE NON SI TROVA IN NESSUN
+# TUTORIAL E CAMBIA IL SIGNIFICATO DI TUTTI I NUMERI QUI SOTTO.
+#
+# I due aspetti si avvolgono a vicenda, e ci sono due modi:
+#
+#   RETRY FUORI (il default di Resilience4j)
+#       retry( breaker( chiamata ) )
+#       Ogni TENTATIVO e' un campione del breaker. Una prenotazione andata
+#       male ne vale tre, quindi "minimumNumberOfCalls: 10" non vuol dire
+#       dieci prenotazioni ma dieci tentativi di rete: il circuito si apre
+#       dopo tre prenotazioni e mezza, non dopo dieci. E a circuito APERTO il
+#       retry ritenta comunque, aspettando 600ms per farsi dire tre volte di
+#       fila cio' che si sapeva gia' — proprio mentre il breaker esiste per
+#       rispondere SUBITO.
+#
+#   BREAKER FUORI (quello che scegliamo qui)
+#       breaker( retry( chiamata ) )
+#       Una PRENOTAZIONE e' un campione, ritentata o no. I numeri del passo
+#       7.2 contano cio' che l'utente ha chiesto, che e' l'unica unita' di
+#       cui si possa ragionare. E a circuito aperto si risponde in
+#       microsecondi, senza ritentare niente.
+#
+# Si scambiano i due valori di default (LOWEST_PRECEDENCE - 4 e - 5): il
+# numero piu' BASSO e' quello che sta piu' fuori.
+# ===========================================================================
+resilience4j:
+
+  circuitbreaker:
+    circuitBreakerAspectOrder: 2147483642    # fuori  (era il default del retry)
+    configs:
+      default:
+        # Le ultime 20 chiamate, non gli ultimi N secondi: una finestra a
+        # conteggio si comporta allo stesso modo con dieci richieste al
+        # minuto e con mille al secondo.
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 20
+
+        # PASSO 7.2 — LA RIGA CHE EVITA IL BREAKER ISTERICO.
+        # Sotto le 10 chiamate il breaker NON decide niente. Senza, le prime
+        # due chiamate andate male dopo un deploy farebbero il 100% di
+        # fallimenti su due campioni e aprirebbero il circuito con il
+        # servizio a valle perfettamente sano.
+        minimumNumberOfCalls: 10
+
+        # Meta' delle chiamate fallite: non e' un intoppo, e' un guasto.
+        failureRateThreshold: 50
+
+        # Quanto resta aperto prima di concedere un tentativo di prova.
+        waitDurationInOpenState: 10s
+
+        # In HALF_OPEN passano 3 chiamate di prova: se vanno bene il circuito
+        # si richiude, se vanno male si riapre per altri 10 secondi. Il
+        # default e' 10, che su un servizio ancora fragile e' una martellata.
+        permittedNumberOfCallsInHalfOpenState: 3
+
+        # Lo stato del breaker si legge da Actuator (passo 7.7).
+        #
+        # ATTENZIONE, SU BOOT 4 QUESTE DUE RIGHE NON BASTANO. L'indicatore che
+        # registrerebbero sta in resilience4j-spring-boot3, compilato contro i
+        # nomi di Boot 3: in Boot 4 le classi della salute hanno cambiato
+        # package e quell'auto-configurazione viene scartata IN SILENZIO. Il
+        # breaker funziona lo stesso e si vede in /actuator/circuitbreakers;
+        # a rimetterlo in /actuator/health e' BreakerHealthIndicator, venti
+        # righe scritte a mano contro l'API nuova.
+        #
+        # Le due righe restano perche' sono quelle giuste e torneranno a
+        # bastare il giorno in cui resilience4j pubblichera' il modulo per
+        # Boot 4.
+        registerHealthIndicator: true
+        # false: un breaker aperto NON rende malati NOI. Il nostro processo sta
+        # benissimo, e' un altro a non rispondere; dichiararci DOWN ci farebbe
+        # togliere dal bilanciatore o riavviare per colpa di un guasto che non
+        # e' nostro — e riavviarci non sistemerebbe il servizio a valle.
+        allowHealthIndicatorToFail: false
+
+        # =================================================================
+        # QUALI ECCEZIONI CONTANO COME "FALLIMENTO", ED E' LA PARTE CHE SI
+        # DIMENTICA SEMPRE.
+        #
+        # Conta SOLO il servizio a valle che non risponde. Un 404 (lo
+        # spettacolo non esiste) e un 409 (posti esauriti) sono risposte
+        # PERFETTE a domande sbagliate: se contassero, bastarebbero dieci
+        # utenti che cercano uno spettacolo cancellato per aprire il
+        # circuito e togliere il servizio a tutti gli altri.
+        #
+        # Non c'e' nemmeno il 4xx non tradotto: quello e' un bug NOSTRO
+        # (passo 6.9), e aprire il circuito non lo risolve.
+        # =================================================================
+        recordExceptions:
+          - it.its.cinema.bookingservice.domain.ServizioNonDisponibileException
+        ignoreExceptions:
+          - it.its.cinema.bookingservice.domain.SpettacoloNonTrovatoException
+          - it.its.cinema.bookingservice.domain.PostiEsauritiException
+
+    # Un breaker PER SERVIZIO, mai uno globale: pricing in ginocchio non deve
+    # chiudere il circuito verso shows, che sta benissimo.
+    instances:
+      shows:
+        baseConfig: default
+      pricing:
+        baseConfig: default
+      # Ci sono gia' e oggi non li usa nessuno: i due servizi del G8. Averli
+      # qui costa una riga e rende il G8 una modifica di codice, non di
+      # configurazione.
+      payment:
+        baseConfig: default
+      loyalty:
+        baseConfig: default
+
+  # -------------------------------------------------------------------------
+  # PASSO 7.3 — IL RETRY, CON BACKOFF E JITTER.
+  # -------------------------------------------------------------------------
+  retry:
+    retryAspectOrder: 2147483643             # dentro (era il default del breaker)
+    configs:
+      default:
+        # 3 in tutto: l'originale piu' due ritentativi. Tutti e tre insieme
+        # valgono UN campione per il breaker: vedi il commento sull'ordine
+        # degli aspetti, in cima.
+        maxAttempts: 3
+        waitDuration: 200ms
+
+        # Backoff esponenziale: 200ms, poi 400ms. Ritentare subito ritenta
+        # dentro lo stesso guasto; aspettare un po' di piu' ogni volta da al
+        # servizio a valle il tempo di rialzarsi.
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+
+        # IL JITTER, E PERCHE' NON E' UN DETTAGLIO.
+        # Senza, mille client colpiti dallo stesso guasto ritentano tutti
+        # nello stesso millisecondo: il servizio si rialza, prende in faccia
+        # mille richieste insieme e ricade. Il caso peggiore e' proprio il
+        # momento della ripresa. Con il jitter l'ondata si spalma.
+        enableRandomizedWait: true
+        randomizedWaitFactor: 0.5
+
+        # Si ritenta SOLO cio' che ha senso ritentare: il servizio che non
+        # ha risposto. Un 404 o un 409 ritentati danno tre volte la stessa
+        # risposta, e un 400 tre volte lo stesso bug nostro — con in piu'
+        # tre volte il tempo di attesa per l'utente.
+        retryExceptions:
+          - it.its.cinema.bookingservice.domain.ServizioNonDisponibileException
+
+    # ATTENZIONE, QUI C'E' UNA COSA CHE MANCA ED E' VOLUTO (passo 7.3).
+    #
+    # Le istanze ci sono, ma il retry non e' attaccato a TUTTE le chiamate:
+    # lo si annota solo dove RIPETERE E' SICURO (vedi ShowsClient).
+    # GET /shows/{id} e POST /prices/quote sono letture e calcoli puri:
+    # ripeterli non cambia niente in nessun posto. POST /shows/{id}/reserve
+    # cambia lo stato di un altro servizio e oggi NON e' idempotente: un
+    # timeout dopo che i posti sono gia' stati scalati, ritentato, li scala
+    # una seconda volta. Il retry lo si potra' accendere al G8, quando
+    # shows-service riconoscera' il sagaId gia' visto.
+    #
+    # E nessun retry su payment, mai: un pagamento rifiutato e' una risposta
+    # di dominio, e ritentarla la rende solo sbagliata tre volte.
+    instances:
+      shows:
+        baseConfig: default
+      pricing:
+        baseConfig: default
+
 springdoc:
   swagger-ui:
     path: /swagger-ui.html
@@ -57,6 +248,45 @@ logging:
   level:
     org.hibernate.SQL: ${SQL_LOG_LEVEL:DEBUG}
     it.its.cinema.bookingservice: INFO
+
+# ===========================================================================
+# ACTUATOR — e il posto in cui si legge lo stato del breaker (passo 7.7).
+#
+# Liveness e readiness sono DUE DOMANDE DIVERSE:
+#   /actuator/health/liveness   "il processo e' vivo?"      se no, riavviami
+#   /actuator/health/readiness  "posso ricevere traffico?"  se no, non mandarmene
+#
+# ATTENZIONE, e' il punto da discutere in aula: la readiness di
+# booking-service NON deve dipendere dalla salute di shows-service e
+# pricing-service. Sembrerebbe sensato ("senza di loro non so prenotare") ed
+# e' un errore grave: un guasto di un servizio a valle toglierebbe dal
+# bilanciatore anche le nostre istanze sane, e GET /bookings — che non chiama
+# nessuno — smetterebbe di rispondere insieme a POST /bookings.
+# I guasti a valle si gestiscono con i 503 del passo 6.9 e con il circuit
+# breaker del G7, non spegnendosi.
+#
+# Il gruppo readiness qui sotto e' scritto ESPLICITAMENTE proprio per questo:
+# dice quali indicatori contano, e i breaker non sono fra quelli. Un circuito
+# aperto si vede in /actuator/health, e NON toglie il servizio dal traffico.
+# ===========================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        # circuitbreakers: lo stato di ogni breaker (CLOSED / OPEN / HALF_OPEN)
+        # circuitbreakerevents e retryevents: lo storico, cioe' QUANDO e'
+        # cambiato e per colpa di quale chiamata. E' cio' che si guarda
+        # quando "ogni tanto risponde 503" e nessuno sa perche'.
+        include: health,info,circuitbreakers,circuitbreakerevents,retries,retryevents
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      group:
+        readiness:
+          include: readinessState
+
 
 # ===========================================================================
 # Il profilo "docker", dopo il separatore --- (passo 5.4).
@@ -71,26 +301,3 @@ logging:
   level:
     org.hibernate.SQL: ${SQL_LOG_LEVEL:INFO}
     it.its.cinema.bookingservice: ${BOOKING_LOG_LEVEL:INFO}
-
-# Liveness e readiness sono DUE DOMANDE DIVERSE:
-#   /actuator/health/liveness   "il processo e' vivo?"      se no, riavviami
-#   /actuator/health/readiness  "posso ricevere traffico?"  se no, non mandarmene
-#
-# ATTENZIONE, e' il punto da discutere in aula: la readiness di
-# booking-service NON deve dipendere dalla salute di shows-service e
-# pricing-service. Sembrerebbe sensato ("senza di loro non so prenotare") ed
-# e' un errore grave: un guasto di un servizio a valle toglierebbe dal
-# bilanciatore anche le nostre istanze sane, e GET /bookings — che non chiama
-# nessuno — smetterebbe di rispondere insieme a POST /bookings.
-# I guasti a valle si gestiscono con i 503 del passo 6.9 e con il circuit
-# breaker del G7, non spegnendosi.
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info
-  endpoint:
-    health:
-      probes:
-        enabled: true
-      show-details: always

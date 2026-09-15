@@ -6,8 +6,31 @@
 ###
 ### CONSEGNA G6: la POST qui sotto crea la prenotazione con il prezzo
 ### corretto e i posti scalati, attraversando tre processi.
+###
+### CONSEGNA G7: con pricing spento il sistema degrada con grazia invece di
+### cadere, e lo stato del breaker si legge da Actuator. Le prove stanno in
+### fondo al file.
 
 @host = http://localhost:8083
+
+### PASSO 7.6 — le chiavi di idempotenza.
+###
+### La chiave la sceglie il CLIENT, una per INTENZIONE di acquisto. Qui sono
+### variabili apposta, UNA PER RICHIESTA: due richieste diverse devono avere
+### chiavi diverse, o la seconda si prenderebbe la risposta della prima.
+###
+### Per rifare da capo una prenotazione gia' andata a buon fine, si cambia il
+### valore della sua chiave: e' il modo di dire "questo e' un acquisto NUOVO,
+### non la ripetizione di quello di prima".
+@chiave = 8f14e45f-ceea-467a-9c7e-8a0b1f2d3c4e
+@chiave2 = 1a2b3c4d-0000-4000-8000-000000000002
+@chiave3 = 1a2b3c4d-0000-4000-8000-000000000003
+@chiave4 = 1a2b3c4d-0000-4000-8000-000000000004
+@chiave5 = 1a2b3c4d-0000-4000-8000-000000000005
+@chiave6 = 1a2b3c4d-0000-4000-8000-000000000006
+@chiave7 = 1a2b3c4d-0000-4000-8000-000000000007
+@chiave8 = 1a2b3c4d-0000-4000-8000-000000000008
+@chiave9 = 1a2b3c4d-0000-4000-8000-000000000009
 
 
 ### =====================================================================
@@ -22,11 +45,15 @@
 ###   3. POST shows-service   /shows/1/reserve  i posti vengono scalati
 ###   4. INSERT su booking_db                   -> 201
 ###
+### Il passo 0 non e' in elenco perche' non si vede: prima di tutto questo si
+### cerca la Idempotency-Key. Se c'era gia', i quattro passi non avvengono.
+###
 ### Nella risposta c'e' il sagaId: cercarlo nei log di TUTTI E TRE i servizi
 ### mostra la stessa operazione vista da tre processi diversi.
 ###     docker compose logs | grep <sagaId>
 POST {{host}}/bookings
 Content-Type: application/json
+Idempotency-Key: {{chiave}}
 
 {
   "showId": 1,
@@ -38,6 +65,7 @@ Content-Type: application/json
 ### La stessa cosa a prezzo pieno
 POST {{host}}/bookings
 Content-Type: application/json
+Idempotency-Key: {{chiave2}}
 
 {
   "showId": 1,
@@ -71,6 +99,7 @@ GET {{host}}/bookings?page=0&size=10&sort=createdAt,desc
 ### che non c'e', non e' un guasto nostro.
 POST {{host}}/bookings
 Content-Type: application/json
+Idempotency-Key: {{chiave3}}
 
 {
   "showId": 99999,
@@ -85,6 +114,7 @@ Content-Type: application/json
 ### i posti finiscono.
 POST {{host}}/bookings
 Content-Type: application/json
+Idempotency-Key: {{chiave4}}
 
 {
   "showId": 1,
@@ -105,6 +135,7 @@ Content-Type: application/json
 ### un minuto: sono i timeout del passo 6.6.
 POST {{host}}/bookings
 Content-Type: application/json
+Idempotency-Key: {{chiave8}}
 
 {
   "showId": 1,
@@ -122,6 +153,7 @@ Content-Type: application/json
 ### arriverebbe fino a shows-service a fargli fare lavoro per niente.
 POST {{host}}/bookings
 Content-Type: application/json
+Idempotency-Key: {{chiave5}}
 
 {
   "showId": 1,
@@ -133,6 +165,7 @@ Content-Type: application/json
 ### Categoria sconosciuta  ->  400
 POST {{host}}/bookings
 Content-Type: application/json
+Idempotency-Key: {{chiave6}}
 
 {
   "showId": 1,
@@ -147,6 +180,7 @@ Content-Type: application/json
 ### vulnerabilita' piu' classica di un carrello.
 POST {{host}}/bookings
 Content-Type: application/json
+Idempotency-Key: {{chiave7}}
 
 {
   "showId": 1,
@@ -165,11 +199,145 @@ GET {{host}}/bookings/abc
 
 
 ### =====================================================================
+###  IL G7 — IDEMPOTENZA (7.6) E RESILIENZA (7.7)
+### =====================================================================
+
+### PASSO 7.6 — LA STESSA CHIAVE DUE VOLTE  ->  201, poi 200
+###
+### Eseguire la PRIMA prenotazione in cima al file, e poi ESEGUIRE QUESTA.
+### Stessa chiave, stesso corpo: la risposta e' 200 e non 201, il corpo e'
+### identico (stesso id, stesso sagaId, stesso totale) e — la parte che
+### conta — i posti su shows-service NON vengono scalati una seconda volta.
+###
+### E' il doppio clic dell'utente con la rete lenta, che senza questo passo
+### sono due prenotazioni e due addebiti.
+POST {{host}}/bookings
+Content-Type: application/json
+Idempotency-Key: {{chiave}}
+
+{
+  "showId": 1,
+  "customerType": "STUDENT",
+  "quantity": 2
+}
+
+
+### Senza l'header  ->  400 con type "idempotency-key-mancante"
+###
+### Obbligatorio e non generato da noi quando manca: una chiave diversa a
+### ogni richiesta e' esattamente come non averla, e il difetto si
+### scoprirebbe in produzione al primo doppio clic invece che qui.
+POST {{host}}/bookings
+Content-Type: application/json
+
+{
+  "showId": 1,
+  "customerType": "STUDENT",
+  "quantity": 2
+}
+
+
+### =====================================================================
+###  PASSO 7.7 — PROVARE IL GUASTO A MANO
+###
+###  Da un altro terminale, in cinema-deploy:
+###      docker compose stop pricing-service
+###
+###  Poi servono 10-12 prenotazioni di fila, ognuna con una chiave DIVERSA
+###  (con la stessa, dalla seconda in poi risponderebbe la prenotazione di
+###  prima senza chiamare nessuno — il passo 7.6 funziona anche qui). A mano
+###  e' scomodo, e allora si fa dal terminale:
+###
+###      for i in $(seq 1 12); do
+###        curl -s -o /dev/null -w "%{http_code} in %{time_total}s\n" \
+###             -X POST localhost:8083/bookings \
+###             -H "Content-Type: application/json" \
+###             -H "Idempotency-Key: $(uuidgen)" \
+###             -d '{"showId":1,"customerType":"STUDENT","quantity":2}'
+###      done
+###
+###  La colonna dei tempi e' la parte da guardare: e' li' che si vede il
+###  circuito aprirsi.
+###
+###  Cosa si deve vedere, in quest'ordine:
+###
+###   1. le prime volte      503 in MENO DI 3 SECONDI, non dopo un minuto.
+###                          Sono i timeout del passo 6.6 piu' i due
+###                          ritentativi del 7.3.
+###
+###   2. dalla decima        il circuito si apre. Da li' in poi il 503
+###                          arriva ISTANTANEO: non stiamo piu' nemmeno
+###                          provando a chiamare pricing.
+###                          (10 = minimumNumberOfCalls del passo 7.2)
+###
+###   3. il corpo            resta un 503 con Retry-After e "servizio":
+###                          "pricing-service". MAI un 500, e mai un prezzo
+###                          inventato — e' il passo 7.5.
+###
+###   4. dopo 10 secondi     waitDurationInOpenState: il circuito concede
+###                          tre chiamate di prova. Con pricing ancora
+###                          spento si richiude subito.
+###
+###  Poi:  docker compose start pricing-service
+###  e la prima richiesta dopo la riapertura torna a funzionare da sola.
+###  Nessuno ha dovuto riavviare booking-service.
+### =====================================================================
+
+### Una singola prenotazione con pricing spento  ->  503, non 500
+### Cambiare @chiave9 in cima a ogni nuovo tentativo.
+POST {{host}}/bookings
+Content-Type: application/json
+Idempotency-Key: {{chiave9}}
+
+{
+  "showId": 1,
+  "customerType": "STUDENT",
+  "quantity": 2
+}
+
+
+### Lo stato di TUTTI i breaker  (passo 7.7)
+### shows, pricing, e i due del G8 che ancora non usa nessuno.
+GET {{host}}/actuator/circuitbreakers
+
+
+### Lo stesso, da /actuator/health: guardare components.circuitBreakers
+###
+### ATTENZIONE alla riga "status": resta UP anche con un circuito aperto, ed
+### e' voluto (allowHealthIndicatorToFail: false). Un breaker aperto dice che
+### e' rotto QUALCUN ALTRO: il nostro processo sta benissimo, e dichiararsi
+### malati ci farebbe togliere dal bilanciatore per colpa di un guasto che
+### non e' nostro.
+GET {{host}}/actuator/health
+
+
+### LO STORICO: quando il circuito e' cambiato di stato, e per quale chiamata
+### E' cio' che si guarda quando "ogni tanto risponde 503" e nessuno sa dire
+### quando e' cominciato.
+GET {{host}}/actuator/circuitbreakerevents/pricing
+
+
+### I ritentativi: quante chiamate sono riuscite AL SECONDO TENTATIVO
+### Un numero che cresce e' un servizio a valle instabile che il retry sta
+### nascondendo all'utente. Nascosto all'utente, non a chi opera.
+GET {{host}}/actuator/retries
+GET {{host}}/actuator/retryevents/pricing
+
+
+### LA PROVA CHE VALE LA GIORNATA  (passo 7.7)
+### Con pricing spento e il circuito APERTO, questa continua a rispondere
+### 200 istantaneo: non chiama nessuno, i dati sono nostri dal passo 6.3.
+### "Degrada con grazia" vuol dire esattamente questo — si perde la
+### possibilita' di prenotare, non il servizio.
+GET {{host}}/bookings/1
+
+
+### =====================================================================
 ###  LE SONDE DI SALUTE
 ### =====================================================================
 
 ### Attenzione: la readiness di booking-service NON dipende dalla salute di
-### shows e pricing, ed e' voluto. Se ci dipendesse, un guasto a valle
+### shows e pricing — ne' dallo stato dei breaker del G7 — ed e' voluto. Se ci dipendesse, un guasto a valle
 ### toglierebbe dal bilanciatore anche le nostre istanze sane e farebbe
 ### smettere di rispondere pure GET /bookings, che non chiama nessuno.
 GET {{host}}/actuator/health/readiness

@@ -4,19 +4,23 @@ Le prenotazioni, e il coordinamento dell'acquisto. Porta **8083**, database
 **`booking_db`** (suo, non uno schema dentro `shows_db`).
 
 È l'unico dei tre servizi che **chiama** gli altri, e questo cambia tutto ciò
-che gli serve addosso: timeout espliciti, traduzione degli errori altrui e —
-dal G7 — circuit breaker e retry.
+che gli serve addosso: timeout espliciti, traduzione degli errori altrui e,
+dal G7, circuit breaker, retry e idempotenza.
 
 ---
 
 ## Il flusso di `POST /bookings` (passo 6.10)
 
 ```
+0. SELECT per Idempotency-Key               se c'è già -> 200, e si finisce qui
 1. GET  shows-service   /shows/{id}        prezzo base, orario, titolo
 2. POST pricing-service /prices/quote      prezzo unitario
 3. POST shows-service   /shows/{id}/reserve   i posti vengono scalati
 4. INSERT su booking_db                     -> 201 Created
 ```
+
+Il passo 0 è del G7 (7.6) ed è il più economico di tutti: una query, e le tre
+chiamate HTTP non avvengono affatto.
 
 **L'ordine è la regola, non un dettaglio.** Riservare prima di conoscere il
 prezzo significherebbe tenere occupati dei posti per un acquisto che potrebbe
@@ -58,15 +62,21 @@ diversi.
 
 ```bash
 curl -s -X POST localhost:8083/bookings -H 'Content-Type: application/json' \
+     -H "Idempotency-Key: $(uuidgen)" \
      -d '{"showId":1,"customerType":"STUDENT","quantity":2}'
 # -> { "sagaId": "3f2a1b9c-...", ... }
 
 docker compose logs | grep 3f2a1b9c-
 ```
 
-Dal G8 diventa la chiave dell'**idempotenza**: il vincolo `UNIQUE` su
-`saga_id` è già nella `V1`, e c'è già un test che lo fa scattare. Un vincolo
-che non si è mai visto fallire è un vincolo di cui non si sa se funziona.
+Dal G8 diventa la chiave dell'idempotenza **verso gli altri servizi**: il
+vincolo `UNIQUE` su `saga_id` è già nella `V1`, e c'è già un test che lo fa
+scattare. Un vincolo che non si è mai visto fallire è un vincolo di cui non si
+sa se funziona.
+
+Non va confuso con l'`Idempotency-Key` del G7 (7.6): quella la sceglie il
+**client**, una per *intenzione*; il `sagaId` lo generiamo noi, uno per
+*tentativo*.
 
 Non si accetta dal client: è l'identità di un'operazione che coordiniamo noi,
 e lasciarla scegliere a chi chiama significherebbe permettergli di riusare
@@ -92,6 +102,160 @@ punto, non il compromesso**.
 
 Il vantaggio si vede subito: `GET /bookings/{id}` non chiama nessuno, e
 funziona anche con `shows-service` spento.
+
+---
+
+## La resilienza (G7)
+
+### Circuit breaker e retry non sono la stessa cosa
+
+| | a cosa serve | cosa fa |
+|---|---|---|
+| **Retry** | il guasto **passeggero**: un pacchetto perso, un riavvio, una latenza momentanea | riprova, con backoff esponenziale e jitter |
+| **Circuit breaker** | il guasto **persistente** | smette di chiamare |
+
+Messi insieme si completano; messi male si sommano — senza breaker, il retry
+**triplica** il carico su un servizio che sta già affogando.
+
+### L'ordine in cui si annidano cambia il significato di tutti i numeri
+
+È la riga che non si trova nei tutorial. Il default di Resilience4j è
+`retry( breaker( chiamata ) )`: ogni **tentativo** è un campione del breaker,
+quindi una prenotazione andata male ne vale tre e `minimumNumberOfCalls: 10`
+non vuol dire dieci prenotazioni ma dieci tentativi di rete. E a circuito
+aperto il retry ritenta comunque, aspettando 600ms per farsi dire tre volte
+ciò che si sapeva già.
+
+Qui l'ordine è invertito in `application.yaml` (`circuitBreakerAspectOrder` /
+`retryAspectOrder`): **`breaker( retry( chiamata ) )`**. Una prenotazione è un
+campione, ritentata o no, e a circuito aperto si risponde in microsecondi.
+
+### Il retry sta solo dove ripetere è sicuro
+
+```
+perId()      GET, una lettura                 @CircuitBreaker + @Retry
+riserva()    POST che SCALA dei posti         @CircuitBreaker, e basta
+rilascia()   POST che RIMETTE dei posti       @CircuitBreaker, e basta
+quote()      calcolo puro                     @CircuitBreaker + @Retry
+```
+
+La regola è l'**idempotenza**, non «è una GET». E il caso in cui il retry
+scatta è proprio quello in cui il danno è più probabile: il **timeout**.
+Timeout non vuol dire «non è arrivata», vuol dire «non so se è arrivata» — il
+più delle volte i posti sono già stati scalati e l'altro sta solo rispondendo
+piano. Ritentare lì significa vendere due volte le stesse poltrone.
+
+Si accenderà al G8, quando `shows-service` riconoscerà il `sagaId` già visto.
+Il `sagaId` viaggia già oggi: è metà del lavoro, fatta in anticipo.
+
+Il **breaker** invece sta su tutti: non riesegue niente, si limita a non
+tentare, e rifiutarsi di chiamare non ha mai effetti collaterali.
+
+### Il fallback è onesto (passo 7.5)
+
+Nessuno dei fallback inventa niente. La tentazione, quando `pricing` non
+risponde, è «usiamo il prezzo base e andiamo avanti»: il sistema resterebbe in
+piedi, nessuno vedrebbe un errore, e venderemmo biglietti all'importo
+sbagliato. Lo scopriremmo settimane dopo, in contabilità.
+
+> Un fallback che mente è peggio di un errore. L'errore lo vedono tutti
+> subito; il dato sbagliato non lo vede nessuno, e resta.
+
+Servono lo stesso, per due cose che senza di loro non ci sarebbero:
+
+1. **il log della causa vera.** Il fallback cattura *qualsiasi* eccezione,
+   quindi maschera ciò che è successo davvero: senza il `causa.toString()` un
+   banale errore di deserializzazione sembrerebbe per sempre «il servizio è
+   giù»;
+2. **la traduzione di `CallNotPermittedException`.** A circuito aperto
+   Resilience4j solleva un'eccezione sua, che `GestoreErrori` non conosce:
+   senza fallback diventerebbe un **500**, cioè «abbiamo un bug» proprio
+   mentre il sistema si sta difendendo come gli abbiamo chiesto.
+
+Tutto il resto risale **intatto**: un 404 resta un 404 e un bug nostro resta
+un 500. Un fallback che trasformasse tutto in 503 renderebbe invisibile ogni
+errore di contratto dietro «è giù qualcun altro».
+
+### Quali eccezioni contano come fallimento
+
+È la parte che si dimentica sempre. Contano **solo** i servizi a valle che non
+rispondono: un 404 (lo spettacolo non esiste) e un 409 (posti esauriti) sono
+risposte *perfette* a domande sbagliate, e se contassero basterebbero dieci
+utenti che cercano uno spettacolo cancellato per aprire il circuito e togliere
+il servizio a tutti gli altri.
+
+### Un breaker aperto non ci rende malati
+
+`/actuator/health` resta **UP** con un circuito aperto, e
+`/actuator/health/readiness` non guarda i breaker affatto. Un breaker aperto
+racconta il guasto di *qualcun altro*: dichiararci DOWN ci farebbe togliere
+dal bilanciatore o riavviare, e riavviarci non sistemerebbe il servizio a
+valle — toglierebbe anche le parti di noi che funzionavano.
+
+> **Trappola Boot 4.** `registerHealthIndicator: true` da solo non basta:
+> l'indicatore di `resilience4j-spring-boot3` è compilato contro i package di
+> Boot 3 e la sua auto-configurazione viene scartata *in silenzio*. Il breaker
+> funziona lo stesso e si vede in `/actuator/circuitbreakers`; a rimetterlo in
+> `/actuator/health` è `BreakerHealthIndicator`, venti righe scritte contro
+> l'API nuova.
+
+---
+
+## L'idempotenza (passo 7.6)
+
+`POST /bookings` pretende un header **`Idempotency-Key`**.
+
+Il caso da cui difendersi è il più comune di tutti: l'utente preme «Paga», la
+rete rallenta, la risposta non arriva, l'utente preme di nuovo. Senza
+idempotenza sono due prenotazioni e due addebiti — e se ne accorge il cliente,
+non noi.
+
+### Non è il `sagaId`
+
+| | chi la genera | una per |
+|---|---|---|
+| `Idempotency-Key` | il **client** | **intenzione** di acquisto |
+| `sagaId` | **noi** | **tentativo** |
+
+Se la chiave la generassimo noi non servirebbe a niente: ogni richiesta ne
+avrebbe una nuova, e due richieste identiche resterebbero due prenotazioni. È
+proprio perché è il client a ripetere la *stessa* stringa che possiamo
+riconoscere il doppione.
+
+L'header è **obbligatorio** e non lo generiamo quando manca: il servizio
+funzionerebbe sempre e l'idempotenza non funzionerebbe mai. Meglio un 400 che
+si nota il primo giorno.
+
+### La difesa è in due tempi, e servono entrambi
+
+**Prima** si cerca la chiave: se c'è, si restituisce la prenotazione di allora
+senza chiamare nessuno.
+
+**Dopo** si salva, e si accetta che il vincolo `UNIQUE` della `V2` possa dire
+di no. Due richieste arrivate *insieme* superano tutte e due il controllo
+applicativo — che non è sbagliato, è semplicemente fatto in un momento in cui
+la risposta può ancora cambiare. Il vincolo invece decide nell'istante della
+scrittura, e decide per **tutte le istanze** del servizio: un controllo in
+Java vive dentro una JVM, il vincolo vive nell'unico posto che le istanze
+condividono.
+
+La violazione **non è un errore da propagare**: si rilegge la riga vincente e
+si restituisce quella. Chi ha chiamato voleva una prenotazione, e ce l'ha.
+
+### 200 e non 201, e soprattutto non 409
+
+Il corpo è identico. Cambia l'affermazione: `201 Created` dice che *questa*
+richiesta ha creato qualcosa, e ripetendola non è vero.
+
+E non è un errore: un 409 insegnerebbe ai client a non ritentare mai, che è il
+contrario di ciò per cui l'idempotenza esiste.
+
+### Il buco che resta
+
+Due richieste in corsa riservano i posti **tutte e due** prima che il vincolo
+ne fermi una. I posti del tentativo perdente restano scalati — è lo stesso
+buco del G6 visto da un'altra porta, il log lo dice a `WARN`, e si chiude al
+G8 con `showsClient.rilascia()`.
 
 ---
 
@@ -228,6 +392,37 @@ cd ../cinema-deploy && docker compose up --build
 Poi `http://localhost:8083/swagger-ui.html`, oppure
 [`http/bookings.http`](http/bookings.http).
 
+### Provare il guasto a mano (passo 7.7)
+
+```bash
+cd ../cinema-deploy && docker compose stop pricing-service
+
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w "%{http_code} in %{time_total}s\n" \
+       -X POST localhost:8083/bookings \
+       -H "Content-Type: application/json" \
+       -H "Idempotency-Key: $(uuidgen)" \
+       -d '{"showId":1,"customerType":"STUDENT","quantity":2}'
+done
+```
+
+La colonna dei tempi è la parte da guardare:
+
+```
+503 in 0.72s      <- i timeout del 6.6 più i due ritentativi del 7.3
+...
+503 in 0.62s      <- la decima: minimumNumberOfCalls
+503 in 0.005s     <- il circuito è aperto, non stiamo più chiamando nessuno
+503 in 0.004s
+```
+
+```bash
+curl -s localhost:8083/actuator/health       # circuitBreakers.pricing.state: OPEN, status: UP
+curl -s localhost:8083/actuator/circuitbreakers
+curl -s localhost:8083/bookings/1            # continua a funzionare: 200 istantaneo
+docker compose start pricing-service         # e riparte da solo, senza riavviare niente
+```
+
 ---
 
 ## I test
@@ -239,9 +434,17 @@ Poi `http://localhost:8083/swagger-ui.html`, oppure
 
 | File | Domanda a cui risponde |
 |---|---|
-| `BookingServiceTest` | la **coreografia**: quali passi, in quale ordine, cosa succede quando uno fallisce. Gateway mockati, niente rete |
-| `BookingControllerTest` | la **tabella di traduzione** del passo 6.9, vista in HTTP |
-| `BookingRepositoryIT` | la `V1` e l'entità dicono la stessa cosa |
+| `BookingServiceTest` | la **coreografia**: quali passi, in quale ordine, cosa succede quando uno fallisce — e l'idempotenza del 7.6, corsa persa compresa. Gateway mockati, niente rete |
+| `BookingControllerTest` | la **tabella di traduzione** del passo 6.9 e il contratto dell'`Idempotency-Key`, visti in HTTP |
+| `BookingRepositoryIT` | la `V1`, la `V2` e l'entità dicono la stessa cosa |
+| `ResilienzaIT` | il G7 è **acceso davvero**: il circuito si apre, il retry ritenta, e `riserva()` non viene ritentata |
+
+`ResilienzaIT` verifica il *cablaggio*, non Resilience4j. Tre cose che non
+falliscono in compilazione: senza `resilience4j-spring-boot3` le annotazioni
+sono decorazioni; con un nome di istanza sbagliato la configurazione del passo
+7.2 non la legge nessuno; con un fallback dalla firma sbagliata arriva una
+`NoSuchMethodException` la prima volta che un servizio va giù. Si scoprono
+solo passandoci dentro.
 
 Dell'`IT` la parte più utile è quella che non si vede: con `ddl-auto: validate`
 il solo avvio del contesto confronta l'entità con lo schema creato da Flyway.
@@ -267,18 +470,20 @@ la saga e la consapevolezza che i dati sono coerenti *alla fine*, non *sempre*.
 ## Un dettaglio sulla readiness
 
 `/actuator/health/readiness` di `booking-service` **non** dipende dalla salute
-di `shows-service` e `pricing-service`.
+di `shows-service` e `pricing-service` — né dallo stato dei breaker del G7.
 
 Sembrerebbe sensato («senza di loro non so prenotare») ed è un errore grave: un
 guasto a valle toglierebbe dal bilanciatore anche le nostre istanze sane, e
 `GET /bookings` — che non chiama nessuno — smetterebbe di rispondere insieme a
 `POST /bookings`. I guasti a valle si gestiscono con i 503 del passo 6.9 e con
-il circuit breaker del G7, **non spegnendosi**.
+il circuit breaker del G7, **non spegnendosi**. Il gruppo `readiness` in
+`application.yaml` è scritto esplicitamente per questo: dice quali indicatori
+contano, e i breaker non sono fra quelli.
 
 ---
 
 ## Stack
 
 Spring Boot 4.1.1 · Java 21 · RestClient (`spring-boot-starter-restclient`,
-obbligatorio in Boot 4) · PostgreSQL 17 · Flyway · springdoc-openapi · Lombok ·
-Testcontainers
+obbligatorio in Boot 4) · Resilience4j (Spring Cloud 2025.1.3) · PostgreSQL 17 ·
+Flyway · springdoc-openapi · Lombok · Testcontainers

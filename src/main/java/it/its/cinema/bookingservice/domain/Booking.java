@@ -57,6 +57,23 @@ public class Booking {
     private Long id;
 
     /**
+     * PASSO 7.6 — LA CHIAVE DI IDEMPOTENZA, CHE ARRIVA DAL CLIENT.
+     *
+     * Non confonderla con il sagaId qui sotto: sono due identita' diverse.
+     *
+     *   idempotencyKey  la sceglie il CLIENT, una per INTENZIONE. "Compra
+     *                   questi due posti" resta una cosa sola anche se il
+     *                   pulsante viene premuto tre volte in ascensore.
+     *   sagaId          lo generiamo NOI, uno per TENTATIVO.
+     *
+     * UNIQUE nel database (V2), e li' sta la protezione vera: il controllo
+     * in Java lo superano entrambe le richieste che arrivano insieme, il
+     * vincolo ne fa passare una sola.
+     */
+    @Column(name = "idempotency_key", nullable = false, unique = true, length = 64)
+    private String idempotencyKey;
+
+    /**
      * PASSO 6.4 — l'identificativo dell'intera operazione di acquisto.
      *
      * Lo generiamo noi (siamo chi coordina) e lo mandiamo identico a ogni
@@ -125,9 +142,20 @@ public class Booking {
      * Il totale lo calcola qui e non lo riceve: un chiamante che potesse
      * passare un totale potrebbe passarne uno sbagliato.
      */
-    public Booking(String sagaId, Long showId, CustomerType customerType, int quantity,
+    public Booking(String idempotencyKey, String sagaId,
+                   Long showId, CustomerType customerType, int quantity,
                    String movieTitle, LocalDateTime startTime, BigDecimal unitPrice) {
 
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new IllegalArgumentException("La chiave di idempotenza e' obbligatoria");
+        }
+        // Il tetto non e' pignoleria: la colonna e' VARCHAR(64), e senza
+        // questo controllo una chiave piu' lunga diventerebbe un errore del
+        // database (un 500) invece che una richiesta rifiutata (un 400).
+        if (idempotencyKey.length() > 64) {
+            throw new IllegalArgumentException(
+                    "La chiave di idempotenza non puo' superare i 64 caratteri");
+        }
         if (sagaId == null || sagaId.isBlank()) {
             throw new IllegalArgumentException("Il sagaId e' obbligatorio");
         }
@@ -150,6 +178,7 @@ public class Booking {
             throw new IllegalArgumentException("Il prezzo unitario non puo' essere negativo");
         }
 
+        this.idempotencyKey = idempotencyKey;
         this.sagaId = sagaId;
         this.showId = showId;
         this.customerType = customerType;

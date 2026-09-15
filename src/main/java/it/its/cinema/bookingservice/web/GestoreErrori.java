@@ -12,6 +12,7 @@ import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
@@ -87,11 +88,14 @@ public class GestoreErrori extends ResponseEntityExceptionHandler {
     /**
      * PASSO 6.4 — il vincolo UNIQUE su saga_id.
      *
-     * Oggi non ci si arriva: il sagaId lo generiamo con UUID.randomUUID() a
-     * ogni richiesta. L'handler c'e' perche' dal G8, quando una saga potra'
-     * essere ritentata, questa sara' la risposta del database a "l'ho gia'
-     * eseguita" — e senza handler diventerebbe un 500 su un'operazione
-     * andata perfettamente a buon fine la prima volta.
+     * Non ci si arriva quasi mai, e dal G7 ancora meno: il sagaId lo
+     * generiamo con UUID.randomUUID() a ogni tentativo, e la violazione del
+     * vincolo su idempotency_key la tratta gia' BookingService, che la
+     * traduce nella prenotazione vincente invece che in un errore (passo
+     * 7.6). Qui resta la rete per il caso che non sappiamo spiegare.
+     *
+     * 409 e non 500: l'operazione non e' fallita per un nostro difetto, e'
+     * stata rifiutata perche' risultava gia' registrata.
      */
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ProblemDetail violazioneDiVincolo(DataIntegrityViolationException e) {
@@ -147,6 +151,31 @@ public class GestoreErrori extends ResponseEntityExceptionHandler {
     public ProblemDetail richiestaNonValida(IllegalArgumentException e) {
         return problema(HttpStatus.BAD_REQUEST, "Richiesta non valida",
                 "richiesta-non-valida", e.getMessage());
+    }
+
+    /**
+     * PASSO 7.6 — l'header Idempotency-Key non c'e'.
+     *
+     * Senza questo metodo la risposta sarebbe comunque un 400: ci pensa la
+     * classe base, che gestisce MissingRequestHeaderException. Il messaggio
+     * pero' sarebbe quello di Spring ("Required header ... is not present"),
+     * che dice cosa manca e non dice cosa farne.
+     *
+     * Vale la riga in piu' perche' questo e' l'errore che incontra CHIUNQUE
+     * provi la POST la prima volta dopo il G7, e la risposta puo' dirgli
+     * direttamente come uscirne.
+     */
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    public ProblemDetail headerMancante(MissingRequestHeaderException e) {
+        if ("Idempotency-Key".equalsIgnoreCase(e.getHeaderName())) {
+            return problema(HttpStatus.BAD_REQUEST, "Idempotency-Key mancante",
+                    "idempotency-key-mancante",
+                    "La prenotazione richiede l'header Idempotency-Key: una stringa "
+                            + "scelta da chi chiama, la stessa a ogni ripetizione della "
+                            + "stessa richiesta (un UUID va benissimo).");
+        }
+        return problema(HttpStatus.BAD_REQUEST, "Header mancante", "header-mancante",
+                "Manca l'header obbligatorio '" + e.getHeaderName() + "'.");
     }
 
     /** GET /bookings/abc — l'id nel path non e' un numero. */

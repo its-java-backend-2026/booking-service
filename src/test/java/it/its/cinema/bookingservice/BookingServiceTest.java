@@ -2,6 +2,7 @@ package it.its.cinema.bookingservice;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Optional;
 
 import it.its.cinema.bookingservice.client.PricingClient;
 import it.its.cinema.bookingservice.client.ShowsClient;
@@ -13,6 +14,7 @@ import it.its.cinema.bookingservice.domain.ServizioNonDisponibileException;
 import it.its.cinema.bookingservice.domain.SpettacoloNonTrovatoException;
 import it.its.cinema.bookingservice.repository.BookingRepository;
 import it.its.cinema.bookingservice.service.BookingService;
+import it.its.cinema.bookingservice.service.EsitoPrenotazione;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -21,6 +23,7 @@ import org.mockito.InOrder;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -49,7 +52,7 @@ import static org.mockito.Mockito.when;
  * Gira in millisecondi.
  */
 @ExtendWith(MockitoExtension.class)
-@DisplayName("BookingService — la saga del passo 6.10")
+@DisplayName("BookingService — la saga del passo 6.10 e l'idempotenza del 7.6")
 class BookingServiceTest {
 
     @Mock
@@ -67,21 +70,40 @@ class BookingServiceTest {
     /** Uno spettacolo serale da 10.00: l'esempio del passo 6.1. */
     private ShowJson spettacolo;
 
+    /** PASSO 7.6 — la chiave la sceglie il client, qui la scegliamo noi per lui. */
+    private static final String CHIAVE = "chiave-del-client-1";
+
     @BeforeEach
     void setUp() {
         spettacolo = new ShowJson(1L, "Dune - Parte Due",
                 LocalDateTime.of(2027, 1, 15, 21, 0), new BigDecimal("10.00"), true);
     }
 
+    /**
+     * Dal passo 7.6 ogni prenotazione comincia con "questa chiave l'ho gia'
+     * vista?". Rispondere "no" e' il caso normale, e ripeterlo in ogni test
+     * non aggiungerebbe niente a nessuno di loro.
+     */
+    private void chiaveMaiVista() {
+        when(repository.findByIdempotencyKey(CHIAVE)).thenReturn(Optional.empty());
+    }
+
+    private Booking prenotazioneGiaEsistente() {
+        return new Booking(CHIAVE, "saga-di-ieri", 1L, CustomerType.STUDENT, 2,
+                "Dune - Parte Due", LocalDateTime.of(2027, 1, 15, 21, 0),
+                new BigDecimal("10.00"));
+    }
+
     @Test
     @DisplayName("I quattro passi avvengono nell'ordine del passo 6.10")
     void iQuattroPassiInOrdine() {
+        chiaveMaiVista();
         when(showsClient.perId(1L)).thenReturn(spettacolo);
         when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
                 .thenReturn(new BigDecimal("10.00"));
         when(repository.save(any())).thenAnswer(i -> i.getArgument(0));
 
-        service.crea(1L, CustomerType.STUDENT, 2);
+        service.crea(CHIAVE, 1L, CustomerType.STUDENT, 2);
 
         // L'ORDINE E' LA REGOLA, non un dettaglio: riservare PRIMA di sapere
         // il prezzo significherebbe tenere occupati dei posti per un acquisto
@@ -106,12 +128,13 @@ class BookingServiceTest {
     @Test
     @DisplayName("Titolo, orario e prezzo unitario finiscono sulla prenotazione (passo 6.3)")
     void copiaIDatiAlMomentoDellAcquisto() {
+        chiaveMaiVista();
         when(showsClient.perId(1L)).thenReturn(spettacolo);
         when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
                 .thenReturn(new BigDecimal("10.00"));
         when(repository.save(any())).thenAnswer(i -> i.getArgument(0));
 
-        Booking creata = service.crea(1L, CustomerType.STUDENT, 2);
+        Booking creata = service.crea(CHIAVE, 1L, CustomerType.STUDENT, 2).prenotazione();
 
         assertThat(creata.getMovieTitle()).isEqualTo("Dune - Parte Due");
         assertThat(creata.getStartTime()).isEqualTo(LocalDateTime.of(2027, 1, 15, 21, 0));
@@ -129,13 +152,14 @@ class BookingServiceTest {
     @Test
     @DisplayName("Il sagaId e' generato qui, uguale per tutti i passi e diverso a ogni acquisto")
     void sagaIdUnicoECoerente() {
+        when(repository.findByIdempotencyKey(anyString())).thenReturn(Optional.empty());
         when(showsClient.perId(1L)).thenReturn(spettacolo);
         when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
                 .thenReturn(new BigDecimal("10.00"));
         when(repository.save(any())).thenAnswer(i -> i.getArgument(0));
 
-        Booking prima = service.crea(1L, CustomerType.STANDARD, 1);
-        Booking seconda = service.crea(1L, CustomerType.STANDARD, 1);
+        Booking prima = service.crea("chiave-a", 1L, CustomerType.STANDARD, 1).prenotazione();
+        Booking seconda = service.crea("chiave-b", 1L, CustomerType.STANDARD, 1).prenotazione();
 
         assertThat(prima.getSagaId()).isNotBlank();
         assertThat(prima.getSagaId()).isNotEqualTo(seconda.getSagaId());
@@ -147,14 +171,17 @@ class BookingServiceTest {
     @Test
     @DisplayName("Se lo spettacolo non esiste ci si ferma subito: niente preventivo, niente riserva")
     void spettacoloInesistenteFermaTutto() {
+        chiaveMaiVista();
         when(showsClient.perId(99L)).thenThrow(new SpettacoloNonTrovatoException(99L));
 
-        assertThatThrownBy(() -> service.crea(99L, CustomerType.STANDARD, 2))
+        assertThatThrownBy(() -> service.crea(CHIAVE, 99L, CustomerType.STANDARD, 2))
                 .isInstanceOf(SpettacoloNonTrovatoException.class);
 
         verifyNoInteractions(pricingClient);
         verify(showsClient, never()).riserva(any(), anyInt(), anyString());
-        verifyNoInteractions(repository);
+        // Il repository e' stato interrogato (passo 0, la chiave), ma niente
+        // e' stato scritto: e' quello che conta.
+        verify(repository, never()).save(any());
     }
 
     /**
@@ -169,30 +196,32 @@ class BookingServiceTest {
     @Test
     @DisplayName("Se pricing non risponde non si riserva niente: il fallimento e' pulito")
     void pricingGiuNonRiservaNiente() {
+        chiaveMaiVista();
         when(showsClient.perId(1L)).thenReturn(spettacolo);
         when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
                 .thenThrow(new ServizioNonDisponibileException("pricing-service", "timeout"));
 
-        assertThatThrownBy(() -> service.crea(1L, CustomerType.STUDENT, 2))
+        assertThatThrownBy(() -> service.crea(CHIAVE, 1L, CustomerType.STUDENT, 2))
                 .isInstanceOf(ServizioNonDisponibileException.class);
 
         verify(showsClient, never()).riserva(any(), anyInt(), anyString());
-        verifyNoInteractions(repository);
+        verify(repository, never()).save(any());
     }
 
     @Test
     @DisplayName("Posti esauriti: l'eccezione sale intatta e non si salva niente")
     void postiEsauritiNonSalvaNiente() {
+        chiaveMaiVista();
         when(showsClient.perId(1L)).thenReturn(spettacolo);
         when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
                 .thenReturn(new BigDecimal("10.00"));
         doThrow(new PostiEsauritiException(1L, 500))
                 .when(showsClient).riserva(eq(1L), eq(500), anyString());
 
-        assertThatThrownBy(() -> service.crea(1L, CustomerType.STUDENT, 500))
+        assertThatThrownBy(() -> service.crea(CHIAVE, 1L, CustomerType.STUDENT, 500))
                 .isInstanceOf(PostiEsauritiException.class);
 
-        verifyNoInteractions(repository);
+        verify(repository, never()).save(any());
     }
 
     /**
@@ -214,17 +243,129 @@ class BookingServiceTest {
     @Test
     @DisplayName("G6, il buco noto: se il salvataggio fallisce i posti restano riservati")
     void seIlSalvataggioFallisceIPostiRestanoRiservati() {
+        chiaveMaiVista();
         when(showsClient.perId(1L)).thenReturn(spettacolo);
         when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
                 .thenReturn(new BigDecimal("10.00"));
         when(repository.save(any())).thenThrow(new RuntimeException("database pieno"));
 
-        assertThatThrownBy(() -> service.crea(1L, CustomerType.STUDENT, 2))
+        assertThatThrownBy(() -> service.crea(CHIAVE, 1L, CustomerType.STUDENT, 2))
                 .isInstanceOf(RuntimeException.class);
 
         // i posti SONO stati riservati...
         verify(showsClient).riserva(eq(1L), eq(2), anyString());
         // ...e nessuno li rimette a posto. E' il problema del G8.
         verify(showsClient, never()).rilascia(any(), anyInt(), anyString());
+    }
+
+    // =====================================================================
+    //  PASSO 7.6 — L'IDEMPOTENZA
+    // =====================================================================
+
+    /**
+     * IL CASO PER CUI ESISTE TUTTO IL PASSO 7.6.
+     *
+     * L'utente ha premuto due volte. La seconda richiesta non deve creare
+     * niente, e soprattutto non deve CHIAMARE niente: nessun preventivo,
+     * nessuna riserva. Sono le tre chiamate HTTP risparmiate a ogni doppio
+     * clic — e i due posti NON scalati una seconda volta.
+     */
+    @Test
+    @DisplayName("Una chiave gia' vista restituisce la prenotazione di allora senza chiamare nessuno")
+    void chiaveGiaVistaNonChiamaNessuno() {
+        Booking diIeri = prenotazioneGiaEsistente();
+        when(repository.findByIdempotencyKey(CHIAVE)).thenReturn(Optional.of(diIeri));
+
+        EsitoPrenotazione esito = service.crea(CHIAVE, 1L, CustomerType.STUDENT, 2);
+
+        assertThat(esito.giaEsistente()).isTrue();
+        assertThat(esito.prenotazione()).isSameAs(diIeri);
+
+        verifyNoInteractions(showsClient);
+        verifyNoInteractions(pricingClient);
+        verify(repository, never()).save(any());
+    }
+
+    /**
+     * LA CORSA, cioe' il caso che il solo controllo applicativo non copre.
+     *
+     * Due richieste con la stessa chiave arrivano insieme: tutte e due
+     * leggono "non c'e'", tutte e due proseguono, e il vincolo UNIQUE della
+     * V2 ne ferma una sulla INSERT. Quella fermata non deve ricevere un
+     * errore — la prenotazione che voleva esiste, l'ha appena scritta
+     * l'altra.
+     *
+     * Si simula facendo rispondere al repository prima "vuoto" (il controllo
+     * del passo 0) e poi, dopo il fallimento della save, la riga vincente.
+     */
+    @Test
+    @DisplayName("La corsa persa sul vincolo UNIQUE diventa la prenotazione vincente, non un errore")
+    void corsaPersaRestituisceLaVincente() {
+        Booking vincitrice = prenotazioneGiaEsistente();
+        when(repository.findByIdempotencyKey(CHIAVE))
+                .thenReturn(Optional.empty())              // il controllo del passo 0
+                .thenReturn(Optional.of(vincitrice));      // la rilettura dopo il vincolo
+        when(showsClient.perId(1L)).thenReturn(spettacolo);
+        when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
+                .thenReturn(new BigDecimal("10.00"));
+        when(repository.save(any()))
+                .thenThrow(new DataIntegrityViolationException("uk_bookings_idempotency_key"));
+
+        EsitoPrenotazione esito = service.crea(CHIAVE, 1L, CustomerType.STUDENT, 2);
+
+        assertThat(esito.giaEsistente()).isTrue();
+        assertThat(esito.prenotazione()).isSameAs(vincitrice);
+    }
+
+    /**
+     * Se il vincolo violato non e' quello della chiave, non e' una corsa: e'
+     * qualcosa che non sappiamo spiegare, e si propaga con il suo stack
+     * trace invece di diventare una risposta inventata.
+     */
+    @Test
+    @DisplayName("Una violazione di vincolo che NON e' la chiave risale intatta")
+    void violazioneDiAltroVincoloRisale() {
+        when(repository.findByIdempotencyKey(CHIAVE)).thenReturn(Optional.empty());
+        when(showsClient.perId(1L)).thenReturn(spettacolo);
+        when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
+                .thenReturn(new BigDecimal("10.00"));
+        when(repository.save(any()))
+                .thenThrow(new DataIntegrityViolationException("uk_bookings_saga_id"));
+
+        assertThatThrownBy(() -> service.crea(CHIAVE, 1L, CustomerType.STUDENT, 2))
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    /**
+     * La chiave finisce SULLA RIGA: e' l'unico modo per riconoscerla la
+     * prossima volta. Sembra ovvio, e un save che la dimentica passerebbe
+     * tutti gli altri test di questa classe.
+     */
+    @Test
+    @DisplayName("La chiave del client finisce sulla prenotazione salvata")
+    void laChiaveFinisceSullaRiga() {
+        chiaveMaiVista();
+        when(showsClient.perId(1L)).thenReturn(spettacolo);
+        when(pricingClient.prezzoUnitario(any(), any(), anyBoolean()))
+                .thenReturn(new BigDecimal("10.00"));
+        when(repository.save(any())).thenAnswer(i -> i.getArgument(0));
+
+        EsitoPrenotazione esito = service.crea(CHIAVE, 1L, CustomerType.STUDENT, 2);
+
+        assertThat(esito.giaEsistente()).isFalse();
+        assertThat(esito.prenotazione().getIdempotencyKey()).isEqualTo(CHIAVE);
+        // la chiave NON e' il sagaId: sono due identita' diverse (passo 7.6)
+        assertThat(esito.prenotazione().getSagaId()).isNotEqualTo(CHIAVE);
+    }
+
+    @Test
+    @DisplayName("Una chiave vuota o troppo lunga e' rifiutata prima di chiamare chiunque")
+    void chiaveNonValidaFermaTutto() {
+        assertThatThrownBy(() -> service.crea("   ", 1L, CustomerType.STUDENT, 2))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> service.crea("k".repeat(65), 1L, CustomerType.STUDENT, 2))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        verifyNoInteractions(showsClient, pricingClient, repository);
     }
 }

@@ -1,6 +1,7 @@
 package it.its.cinema.bookingservice.service;
 
 import java.math.BigDecimal;
+import java.util.Optional;
 import java.util.UUID;
 
 import it.its.cinema.bookingservice.client.PricingClient;
@@ -12,6 +13,7 @@ import it.its.cinema.bookingservice.domain.CustomerType;
 import it.its.cinema.bookingservice.repository.BookingRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -50,6 +52,31 @@ import org.springframework.transaction.annotation.Transactional;
  * Oggi ci si ferma qui, con il buco in vista e il commento che lo dice:
  * un problema che si e' visto succedere si risolve meglio di uno raccontato.
  * ===========================================================================
+ *
+ * ===========================================================================
+ * PASSO 7.6 — E DAL G7, PRIMA DI TUTTO QUESTO, UNA DOMANDA SOLA:
+ * "QUESTA RICHIESTA L'HO GIA' VISTA?"
+ *
+ * Il caso da cui difendersi non e' teorico ed e' il piu' comune di tutti:
+ * l'utente preme "Paga", la rete rallenta, la risposta non arriva, l'utente
+ * preme di nuovo. Senza idempotenza sono due prenotazioni e due addebiti; il
+ * cliente se ne accorge, e non da noi.
+ *
+ * La difesa e' in due tempi, e servono ENTRAMBI:
+ *
+ *   PRIMA   si cerca la chiave. Se c'e', si restituisce la prenotazione di
+ *           allora senza chiamare nessuno. E' il caso normale, e risparmia
+ *           tre chiamate HTTP a ogni doppio clic.
+ *
+ *   DOPO    si salva, e si accetta che il vincolo UNIQUE possa dire di no.
+ *           Due richieste arrivate INSIEME superano tutte e due il controllo
+ *           di prima: a quel punto decide il database, che e' l'unico posto
+ *           che tutte le istanze del servizio condividono.
+ *
+ * La violazione del vincolo NON e' un errore da propagare: e' la risposta
+ * "l'ha gia' fatto qualcun altro". Si rilegge la riga vincente e si
+ * restituisce quella — chi ha chiamato voleva una prenotazione, e ce l'ha.
+ * ===========================================================================
  */
 @Service
 @RequiredArgsConstructor
@@ -76,12 +103,31 @@ public class BookingService {
      * Qui non serve: fino al passo 4 non si tocca il database, e il passo 4
      * e' una singola INSERT, che la sua transazione ce l'ha da sola.
      */
-    public Booking crea(Long showId, CustomerType customerType, int quantita) {
+    public EsitoPrenotazione crea(String chiaveIdempotenza, Long showId,
+                                  CustomerType customerType, int quantita) {
+
+        String chiave = validata(chiaveIdempotenza);
+
+        // --- 0. l'ho gia' vista? ---
+        // Il controllo APPLICATIVO: copre il caso normale (l'utente ha
+        // premuto due volte a distanza di secondi) senza disturbare nessuno.
+        // Non copre le due richieste arrivate nello stesso millisecondo: per
+        // quelle c'e' il vincolo UNIQUE, in fondo al metodo.
+        Optional<Booking> gia = repository.findByIdempotencyKey(chiave);
+        if (gia.isPresent()) {
+            log.info("Idempotency-Key {} gia' vista: restituisco la prenotazione {} "
+                    + "senza chiamare nessuno", chiave, gia.get().getId());
+            return EsitoPrenotazione.ripetuta(gia.get());
+        }
 
         // L'identificativo dell'intera operazione, generato UNA VOLTA e
         // ripetuto identico a ogni servizio coinvolto. E' cio' che permette
         // di ricucire i log di tre processi diversi, e dal G8 e' la chiave
-        // dell'idempotenza.
+        // dell'idempotenza verso gli ALTRI servizi.
+        //
+        // Nuovo a ogni TENTATIVO, mentre la chiave qui sopra e' la stessa a
+        // ogni ripetizione della stessa INTENZIONE: e' la differenza che
+        // rende utili tutti e due.
         String sagaId = UUID.randomUUID().toString();
         log.info("[saga {}] inizio prenotazione: spettacolo {}, {} posti, categoria {}",
                 sagaId, showId, quantita, customerType);
@@ -110,19 +156,76 @@ public class BookingService {
         // --- 4. il fatto storico ---
         // Da qui in avanti la prenotazione esiste. Se questa riga fallisce,
         // i posti del passo 3 restano riservati: vedi il commento in cima.
-        Booking prenotazione = repository.save(new Booking(
-                sagaId,
-                showId,
-                customerType,
-                quantita,
-                spettacolo.movieTitle(),   // passo 6.3: copiati, non referenziati
-                spettacolo.startTime(),
-                prezzoUnitario));
+        try {
+            Booking prenotazione = repository.save(new Booking(
+                    chiave,
+                    sagaId,
+                    showId,
+                    customerType,
+                    quantita,
+                    spettacolo.movieTitle(),   // passo 6.3: copiati, non referenziati
+                    spettacolo.startTime(),
+                    prezzoUnitario));
 
-        log.info("[saga {}] prenotazione {} creata: {} x {} = {}",
-                sagaId, prenotazione.getId(), quantita, prezzoUnitario,
-                prenotazione.getTotalPrice());
-        return prenotazione;
+            log.info("[saga {}] prenotazione {} creata: {} x {} = {}",
+                    sagaId, prenotazione.getId(), quantita, prezzoUnitario,
+                    prenotazione.getTotalPrice());
+            return EsitoPrenotazione.creata(prenotazione);
+
+        } catch (DataIntegrityViolationException e) {
+            // ===============================================================
+            // PASSO 7.6 — LA CORSA PERSA, E NON E' UN ERRORE.
+            //
+            // Ci si arriva solo se due richieste con la STESSA chiave sono
+            // passate insieme dal controllo del passo 0. Il vincolo UNIQUE
+            // della V2 ne ha fatta passare una; questa e' l'altra.
+            //
+            // Chi ha chiamato voleva una prenotazione, e la prenotazione c'e'
+            // — l'ha scritta l'altro thread un istante fa. Rispondergli 409
+            // sarebbe tecnicamente vero e praticamente inutile: si rilegge la
+            // riga vincente e gli si da' quella, che e' esattamente cio' che
+            // avrebbe ricevuto arrivando un millisecondo dopo.
+            // ===============================================================
+            Booking vincitrice = repository.findByIdempotencyKey(chiave)
+                    // Se non c'e', il vincolo violato era un ALTRO (saga_id):
+                    // non e' una corsa, e' un caso che non sappiamo spiegare.
+                    // L'eccezione originale risale e diventa un 409/500 con
+                    // il suo stack trace, invece di un messaggio inventato.
+                    .orElseThrow(() -> e);
+
+            // WARN e non INFO: qui i posti del passo 3 SONO stati scalati due
+            // volte, una per ciascuna delle due richieste in corsa, e nessuno
+            // rimette a posto i nostri. E' lo stesso buco del G6 visto da
+            // un'altra porta, e si chiude al G8 con showsClient.rilascia().
+            log.warn("[saga {}] corsa persa sulla Idempotency-Key {}: vince la "
+                    + "prenotazione {}. ATTENZIONE: i {} posti riservati da questo "
+                    + "tentativo restano scalati (compensazione al G8)",
+                    sagaId, chiave, vincitrice.getId(), quantita);
+
+            return EsitoPrenotazione.ripetuta(vincitrice);
+        }
+    }
+
+    /**
+     * PASSO 7.6 — la chiave arriva da FUORI, quindi si controlla.
+     *
+     * Header presente ma vuoto, o lungo duecento caratteri: sono richieste
+     * sbagliate del client, cioe' dei 400 (l'IllegalArgumentException la
+     * traduce GestoreErrori). Senza questo controllo la seconda diventerebbe
+     * un errore del database su una VARCHAR(64), cioe' un 500 che racconta
+     * un guasto nostro per una richiesta malfatta di qualcun altro.
+     */
+    private static String validata(String chiaveIdempotenza) {
+        if (chiaveIdempotenza == null || chiaveIdempotenza.isBlank()) {
+            throw new IllegalArgumentException(
+                    "L'header Idempotency-Key e' obbligatorio e non puo' essere vuoto");
+        }
+        String chiave = chiaveIdempotenza.trim();
+        if (chiave.length() > 64) {
+            throw new IllegalArgumentException(
+                    "L'header Idempotency-Key non puo' superare i 64 caratteri");
+        }
+        return chiave;
     }
 
     /**
